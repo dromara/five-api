@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-11
+
 ### 功能
 
 - 上游在服务端执行联网搜索（Anthropic `web_search`）时，请求日志的 `cost_detail.unpriced_server_tools.web_search_requests` 记录搜索次数，流式和非流式都支持。目前只记录、不计价，token 计费不变。搜索工具及其结果块原样透传。
@@ -32,6 +34,7 @@
 
 - 整理文档位置：根目录只放 README（中英文）、CHANGELOG、CONTRIBUTING 和 AI 助手入口，其余都在 `docs/`。英文 README 移到根目录 `README.en.md`；路线图移到 `docs/ROADMAP.md`；对外发表的文章统一放在 `docs/articles/`。
 - 删除 `docs/COMPATIBILITY.md`：SDK 与客户端实测版本并入 [接入教程](docs/CLIENTS.md)，流式结束与巡检规则并入 [设计文档](docs/DESIGN.md)，接口列表以 README 为准。删除未被引用的截图。
+- 公众号介绍补上在线试用地址。
 
 ## [0.4.1] - 2026-11-04
 
