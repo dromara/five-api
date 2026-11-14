@@ -218,7 +218,7 @@ async def main():
         base = runs[0]["requests_per_second"]
         for run in runs:
             run["speedup"] = round(run["requests_per_second"] / base, 2)
-        report = {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "version": "0.6.0",
+        report = {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "version": "0.6.1",
                   "billing_mode": settings.BILLING_MODE,
                   "python": platform.python_version(), "platform": platform.platform(), "cpu_count": os.cpu_count(),
                   "tenants": args.tenants, "concurrency": args.concurrency, "requests": args.requests,
