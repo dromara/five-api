@@ -1,6 +1,6 @@
 [project]
 name = "five-api"
-version = "0.6.1"
+version = "0.6.2"
 description = "Simplified AI API Gateway"
 requires-python = ">=3.12"
 license = { text = "MIT" }

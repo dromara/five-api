@@ -26,9 +26,10 @@
 import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useI18n } from '@/i18n'
+import { copyWithCommand } from '@/utils/copyText'
 
 /** Shows a server-generated temporary password once; the page clears it when the dialog closes. */
-defineProps<{
+const props = defineProps<{
   modelValue: boolean
   title: string
   username?: string
@@ -37,24 +38,25 @@ defineProps<{
 }>()
 const emit = defineEmits<{ 'update:modelValue': [value: boolean], closed: [] }>()
 const { t } = useI18n()
-const field = ref<{ select: () => void, input?: HTMLInputElement } | null>(null)
+const field = ref<{ select: () => void } | null>(null)
 
 function selectAll() {
   field.value?.select()
 }
 
 async function copy(): Promise<void> {
-  const input = field.value?.input
-  try {
-    // The clipboard API needs HTTPS or localhost; the console is often opened over plain HTTP.
-    await navigator.clipboard.writeText(input?.value ?? '')
+  const value = props.password
+  if (copyWithCommand(value)) {
     ElMessage.success(t('common.copied'))
     return
-  } catch {
-    input?.select()
   }
-  if (document.execCommand('copy')) ElMessage.success(t('common.copied'))
-  else ElMessage.error(t('keys.copyManual'))
+  try {
+    await navigator.clipboard.writeText(value)
+    ElMessage.success(t('common.copied'))
+  } catch {
+    field.value?.select()
+    ElMessage.error(t('keys.copyManual'))
+  }
 }
 </script>
 
