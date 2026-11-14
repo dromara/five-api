@@ -1,5 +1,52 @@
 # 压测报告
 
+## 默认计费模式（fast），2026-11-14
+
+0.5.0 之后默认 `BILLING_MODE=fast`，用下面同一台机器、同一个脚本和参数（每轮 4000 次、同时 64 个、模拟上游 5 毫秒），同日先测改动前的 `strict`，再测 `fast`：
+
+| 网关进程数 | strict 16 租户 | fast 16 租户 | strict 1 租户 | fast 1 租户 |
+|---|---|---|---|---|
+| 1 | 1.02 万 | 1.90 万 | 7100 | 1.96 万 |
+| 4 | 2.43 万 | 6.27 万 | 8300 | 6.37 万 |
+| 8 | 2.36 万 | 5.91 万 | 8400 | 6.74 万 |
+
+单位为次/分钟。8 个进程、16 个租户时，p50 延迟从 151 毫秒降到 44 毫秒，p99 从 346 毫秒降到 188 毫秒。
+
+- 单个租户不再受行锁限制，和多租户一样快。
+- 花费在压测结束后还要 1.3–3.2 秒才全部入库。把这段时间算进去，4–8 个进程的持续处理能力约每分钟 3.5–4.7 万次，瓶颈仍是同机的 MySQL 写入。
+- 每轮结束后照样核对：日志数等于成功数，Key、租户扣费合计等于日志费用合计，全部通过。`fast` 模式下并发请求可能越过余额，这一项压测没有设余额，不检查。
+
+原始数据：[strict 16 租户](benchmarks/synthetic-strict-16.json)、[strict 1 租户](benchmarks/synthetic-strict-1.json)、[fast 16 租户](benchmarks/synthetic-fast-16.json)、[fast 1 租户](benchmarks/synthetic-fast-1.json)。
+
+对外引用的首字延迟仍是 10 月 31 日那次：比直连慢 6–19 毫秒，见下文。11 月 14 日的重测不采用，第一轮进程继承了机器上的 `http_proxy`，第二轮并发 50 的长尾到了数秒。原始记录留在 [走代理](benchmarks/real-deepseek-fast.json) 和 [不走代理](benchmarks/real-deepseek-fast-noproxy.json)。
+
+## 和 LiteLLM、new-api 同机对比，2026-11-14
+
+三家装在同一台 8 核机器上，接同一个模拟上游（5 毫秒返回），用同一个压测程序：同时 64 个请求、4 个压测进程，请求轮流用 16 个 Key（new-api 是 16 个用户各一个令牌）。三家都用默认配置并开着按 Key 记账：
+
+- Five API：默认 `fast` 模式，8 个进程，MySQL 8 + Redis 7。
+- new-api：`calciumion/new-api` v1.0.0-rc.51，MySQL 8 + Redis 7。
+- LiteLLM：1.109.1，`--num_workers 8`，PostgreSQL 16 + Redis 7。
+
+持续测试每轮 2 万次，计时到每一笔花费都写进网关自己的数据库为止，所以后台异步写库的时间也算在内。单位为次/分钟。
+
+| 网关 | 持续处理能力（3 轮） | 只算响应（3 轮） | p50 延迟 |
+|---|---|---|---|
+| Five API | 4.67 / 5.26 / 5.33 万 | 5.56 / 5.82 / 6.81 万 | 43–56 毫秒 |
+| new-api | 4.30 / 4.52 / 4.45 万 | 4.31 / 4.53 / 4.46 万 | 83–87 毫秒 |
+| LiteLLM | 2.80 万（1 轮） | 2.90 万 | 115 毫秒 |
+
+- 持续处理能力 Five API 比 new-api 高约 15%，是 LiteLLM 的约 1.8 倍；p50 延迟约为 new-api 的一半。另做了每轮 4000 次的短测试各 3 轮，排名相同。
+- new-api 的日志几乎实时写完；LiteLLM 和 Five API 都在后台批量写，压测结束后分别还要约 1.5 秒和 3–4 秒。
+- 这是 `fast` 模式的成绩。`strict` 模式（约 2.4 万次/分钟）低于另外两家，那是用吞吐换余额一分不超。
+- 三家和数据库挤在同一台机器上，结果只用于横向比较，不代表生产容量。
+
+原始数据：[compare-litellm-newapi.json](benchmarks/compare-litellm-newapi.json)。重跑方法：按上面的版本起好三家，new-api 用 [newapi_setup.py](benchmarks/compare/newapi_setup.py) 初始化；Five API 运行 `python -m scripts.benchmark --workers 8 --requests 20000`，另外两家在 `backend` 目录下运行 `PYTHONPATH=. python ../docs/benchmarks/compare/sustained.py <newapi|litellm> <网关地址> <Key 文件> 20000`。
+
+以下为 0.4.0 的 `strict` 模式报告。
+
+## strict 模式（0.4.0）
+
 版本 0.4.0，2026-10-31。压测分两部分：
 
 - **模拟环境**：上游换成本机模拟服务，测网关自身最多能处理多少请求。

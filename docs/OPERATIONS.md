@@ -10,14 +10,15 @@
 
 镜像以 `uvicorn --workers N` 启动多个进程共享同一端口，worker 退出由 Uvicorn 自动拉起。N 默认为容器可用 CPU 核数，最多 8；在 Compose gateway 的 environment 填 `WORKERS` 可改。Kubernetes 等按副本扩容的环境建议 `WORKERS: 1`，多开副本。
 
-- 所有限额、预占与扣费都在 MySQL 行锁与 Redis 中完成，多个 worker、多个容器之间结果一致，不会多扣或超额。
+- 计费模式由 `BILLING_MODE` 决定。默认 `fast`：花费先进 Redis 队列 `five:billing:queue`，每个 worker 每 0.5 秒取最多 500 笔整批写库，待入库金额记在 `five:billing:pending:*`，准入时计入余额；同一时刻并发的请求可能一起越过余额。`strict`：在 MySQL 行锁事务里足额预占，多个 worker、多个容器之间不会超额。两种模式都不会多扣。
+- `fast` 模式下 worker 正在写的批次放在自己的 `five:billing:processing:<id>`，写库失败退回队列；worker 崩溃后由其他 worker 按心跳判断并退回，已入库的按请求 ID 跳过。正常停机会先把队列写完。Redis 必须开启持久化，否则 Redis 丢数据会丢掉还没入库的花费。
 - 每个 worker 在 Redis 写 `five:process:<id>` 心跳（默认 60 秒过期，`PROCESS_STALE_SECONDS`）。worker 崩溃后，其他 worker 接管它留下的预占：未发往上游的释放额度；已发往上游的标为未知结果并继续占用，等待核对，迟到的用量仍按实际金额结算。Redis 不可用时不接管。
 - 结算恢复、额度重置、日志清理、模型巡检和渠道探测用 Redis `SET NX` 按周期认领，同一周期只有一个 worker 执行。
 - 所有 worker 必须使用同一个 SECRET_KEY：不填时入口脚本在容器启动时随机生成一个并传给全部 worker，重启容器后仍需重新登录。
 - 每个 worker 有独立的 MySQL 连接池，默认上限 `200 / WORKERS`（10–50 之间），可用 `MYSQL_POOL_SIZE` 指定。Compose 中的 MySQL 设为 `--max-connections=500`；使用外部 MySQL 时确保 `max_connections` ≥ 容器数 × WORKERS × 连接池上限再加余量。
 - `/metrics` 汇总全部 worker（`PROMETHEUS_MULTIPROC_DIR`，镜像已设置）。
 
-性能见 [压测报告](BENCHMARK.md)：模拟环境下 8 核机器每分钟约 2.6 万次；同一租户的扣费要排队，单个租户每分钟约 9000 次，不随 worker 数增加。真实 DeepSeek 渠道下网关让首字只慢约 20 毫秒以内。
+性能见 [压测报告](BENCHMARK.md)：模拟环境下 8 核机器默认模式每分钟约 6 万次，单个租户也一样；`strict` 模式约 2.4 万次，同一租户的扣费要排队，单个租户约 8400 次，不随 worker 数增加。真实 DeepSeek 渠道下网关让首字只慢约 20 毫秒以内。
 
 留意磁盘：MySQL 默认保留 30 天 binlog，高流量下增长很快，压测中数万次请求就写出了 1GB。磁盘写满时 MySQL 和 Redis 都停止写入，请求和结算会卡住。生产环境要监控磁盘，空间紧张时可执行 `PURGE BINARY LOGS BEFORE NOW() - INTERVAL 3 DAY` 清理旧 binlog。
 

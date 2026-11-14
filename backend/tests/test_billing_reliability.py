@@ -80,7 +80,7 @@ async def test_accounting_rolls_back_and_recovers_exactly_once(client, failure):
 
     faults = {
         "tenant": patch.object(QuerySet, "update", new=injected_update),
-        "log": patch.object(RequestLog, "create", new=AsyncMock(side_effect=RuntimeError("log write failure"))),
+        "log": patch.object(RequestLog, "save", new=AsyncMock(side_effect=RuntimeError("log write failure"))),
         "daily": patch("app.services.logging_service.record_daily_usage", new=AsyncMock(side_effect=RuntimeError("daily failure"))),
     }
     with patch("app.providers.base._shared_http_client", return_value=upstream()), faults[failure]:

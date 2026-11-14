@@ -46,6 +46,7 @@ async def lifespan(app: FastAPI):
         from app.services.logging_service import log_cleanup_loop
         from app.services.metrics import ACTIVE_CHANNELS, ACTIVE_KEYS
         from app.services.settlements import recovery_loop
+        from app.services.fast_billing import flush_loop
         from app.services.model_monitor import model_check_loop
         from app.services import cluster
         from app.models import Channel, APIKey
@@ -60,7 +61,7 @@ async def lifespan(app: FastAPI):
             logging.getLogger(__name__).exception("Worker heartbeat unavailable at startup")
         tasks = tuple(asyncio.create_task(loop()) for loop in (
             cluster.heartbeat_loop, quota_reset_loop, health_check_loop, log_cleanup_loop,
-            recovery_loop, model_check_loop,
+            recovery_loop, model_check_loop, flush_loop,
         ))
         try:
             yield
@@ -69,10 +70,12 @@ async def lifespan(app: FastAPI):
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             from app.services.alerts import drain_alerts
+            from app.services.fast_billing import drain
             from app.services.settlements import recover_once
             try:
                 async with asyncio.timeout(10):
                     await drain_alerts()
+                    await drain()
                     await recover_once()
                     await cluster.leave()
             except Exception:
@@ -135,7 +138,7 @@ def _mount_frontend(app: FastAPI) -> None:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Five API Gateway", version="0.5.0", lifespan=lifespan)
+    app = FastAPI(title="Five API Gateway", version="0.6.0", lifespan=lifespan)
     from app.services.protocol_errors import install_error_handlers
     from app.services.redaction import configure_safe_logging
     install_error_handlers(app)

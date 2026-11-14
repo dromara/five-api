@@ -23,7 +23,7 @@ Five API connects OpenAI, Claude, Gemini, DeepSeek, Qwen and other upstreams. Th
 
 | Use case | Tenants are | Mainly used |
 | --- | --- | --- |
-| Reselling | Your customers | Full reservation without overselling, no unpriced requests, per-channel prices, per-request reconciliation |
+| Reselling | Your customers | No unpriced requests, per-channel prices, per-request reconciliation; `strict` mode when a balance must never be exceeded |
 | Inside a company | Departments, teams or projects | Department budgets and chargeback, rate limits, request audit and leak investigation, degradation checks |
 
 It is not a public relay: there is no self sign-up or online top-up, and accounts are opened by the platform. Nor does it aim to support the most providers; getting the money right comes first.
@@ -32,12 +32,13 @@ It is not a public relay: there is no self sign-up or online top-up, and account
 
 ## Why the money does not leak
 
-Whether you bill customers or charge back departments, the costly failures are budgets overspent, calls never billed and calls billed twice. Five API reserves the money first and only then lets the request through:
+Whether you bill customers or charge back departments, the costly failures are budgets overspent, calls never billed and calls billed twice. `BILLING_MODE` sets how strictly the balance is held:
 
-- **Reserve in full before calling the upstream.** The cost of the input plus the maximum output is checked against the key and tenant balance, together with every in-flight request, inside a MySQL row-locked transaction. Concurrent requests from several workers and keys cannot jointly spend past a balance. If accounting is unavailable the request is refused, never let through to be billed later.
+- **`fast` (default), like LiteLLM.** A request is admitted when spend already written plus spend still queued in Redis is below the balance, with no lock and no reservation. Charges go to a Redis queue and each worker writes them to MySQL in batches every 0.5 seconds. Throughput is about 2.5 times `strict`, but requests running at the same moment can jointly spend past a balance; the excess is still charged.
+- **`strict`: reserve in full before calling the upstream.** The cost of the input plus the maximum output is checked against the key and tenant balance, together with every in-flight request, inside a MySQL row-locked transaction. Concurrent requests from several workers and keys cannot jointly spend past a balance. If accounting is unavailable the request is refused, never let through to be billed later.
 - **No price, no request.** A model without a selling price is rejected instead of billed at zero. Only an explicit zero price makes it free.
 - **The price is fixed before dispatch**, so changing prices mid-request does not affect it.
-- **Charges and logs commit together.** Key debit, tenant debit, request log and daily usage commit in one transaction. Failed accounting is recovered exactly once; requests with an unknown upstream outcome keep their reservation until reviewed.
+- **Charges and logs commit together.** Key debit, tenant debit, request log and daily usage commit in one transaction. Failed accounting is recovered exactly once, and a batch that fails or belongs to an exited worker is requeued and deduplicated by request ID; in `strict` mode requests with an unknown upstream outcome keep their reservation until reviewed.
 - **Disconnected streams are billed** for what was forwarded. Missing upstream usage is estimated from the content, and the log records the usage source.
 
 Usage above the estimate is still charged in full, never under-billed, so a balance can go slightly negative by at most one request, for example when a request sets no `max_tokens` and the reply exceeds the 4096-token default. Have clients set `max_tokens` for a hard cap.
@@ -47,7 +48,8 @@ Usage above the estimate is still charged in full, never under-billed, so a bala
 
 | Guarantee | Tests |
 | --- | --- |
-| Within the estimate, the reservation covers every charge; workers sharing a budget never oversell it | `test_end_to_end_charge_never_exceeds_the_reservation`, `test_two_workers_never_overspend_a_shared_tenant_budget` |
+| `strict`: within the estimate, the reservation covers every charge; workers sharing a budget never oversell it | `test_end_to_end_charge_never_exceeds_the_reservation`, `test_two_workers_never_overspend_a_shared_tenant_budget` |
+| `fast`: queued spend counts against the balance; failed or orphaned batches are charged exactly once | `tests/test_fast_billing.py` |
 | Unpriced models are refused, never billed at zero | `test_unpriced_model_does_not_reach_upstream`, `test_selling_quote_never_silently_prices_at_zero` |
 | Prices are fixed before dispatch | `test_selling_price_is_snapshotted_before_the_upstream_call` |
 | Failed accounting recovers exactly once; unknown outcomes stay reserved | `test_accounting_rolls_back_and_recovers_exactly_once`, `test_timeout_keeps_unknown_work_occupied` |
@@ -66,8 +68,9 @@ The benchmarks recompute every charge from the logged tokens and the price and r
 | | Five API | [new-api](https://github.com/QuantumNous/new-api) | [LiteLLM](https://github.com/BerriAI/litellm) |
 |---|---|---|---|
 | Focus | Provisioned accounts, billing per customer or department | Public relay with self sign-up and online top-up | Internal enterprise egress, 100+ providers |
-| Reservation | Input plus output cap reserved in full, checked in a MySQL transaction | Only estimated input reserved; skipped when the balance exceeds 10 USD | Relies on Redis; hard limits need fail-closed enabled separately |
+| Reservation | None by default, admitted on written plus queued spend; `strict` reserves input plus output cap in full in a MySQL transaction | Only estimated input reserved; skipped when the balance exceeds 10 USD | Relies on Redis; hard limits need fail-closed enabled separately |
 | Unpriced model | Request refused | Price error returned | Allowed and billed at 0 |
+| Same-host throughput (defaults, [measured](docs/BENCHMARK.md)) | 47,000–53,000 requests per minute | 43,000–45,000 | 28,000 |
 | Request audit | Saved per key, secret scanning, AI review report | Request content not stored; viewing prompts is [not planned](https://github.com/QuantumNous/new-api/issues/7609) | Prompt logging optional; secret detection is [enterprise](https://docs.litellm.ai/docs/enterprise) |
 | Tenant-managed keys, IP allowlists | Included under MIT | Supported | Team admins and IP allowlists are enterprise |
 | Model quality checks | Health checks plus degradation reference checks | Connectivity and latency | Connectivity |
@@ -184,6 +187,7 @@ All settings are written directly in `docker-compose.yml`; run `./service.sh dep
 | `SECRET_KEY` | Login token key; without it logins end on every restart |
 | `ENCRYPTION_KEY` | Upstream key encryption; without it a built-in public key is used. Migrate before setting it once channels exist |
 | `WORKERS` | Worker processes, default one per CPU core, up to 8 |
+| `BILLING_MODE` | `fast` (default: admit first, write spend in batches; concurrent requests can exceed a balance) or `strict` (reserve in full; balances are never exceeded) |
 | `ports` | 8080 by default |
 
 For production:
@@ -198,10 +202,12 @@ On one 8-core, 16 GB machine, with every charge reconciled in each run:
 
 | Test | Result |
 |---|---|
-| Simulated upstream capacity | About 26,000 requests per minute across many tenants (8 workers); about 9,000 for a single tenant |
+| Simulated upstream capacity, default `fast` mode | About 60,000 requests per minute (4–8 workers), a single tenant included; 35,000–47,000 sustained once background writes are counted |
+| Same-host comparison, background writes included | Five API 47,000–53,000 requests per minute, new-api 43,000–45,000, LiteLLM 28,000; p50 latency about 50, 85 and 115 ms |
+| Simulated upstream capacity, `strict` mode | About 24,000 requests per minute across many tenants; about 8,400 for a single tenant |
 | Real DeepSeek channel, 10–50 concurrent streams | All succeeded; first token only 6–19 ms slower than calling DeepSeek directly |
 
-A single tenant's requests pass through one row lock, the price of an exact balance. Full data is in the [benchmark report](docs/BENCHMARK.md).
+In `strict` mode a single tenant's requests pass through one row lock, the price of a balance that is never exceeded. Full data is in the [benchmark report](docs/BENCHMARK.md).
 
 ## Limits
 

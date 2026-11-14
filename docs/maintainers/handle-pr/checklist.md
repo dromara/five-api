@@ -13,7 +13,7 @@
 ## 计费与结算
 
 - [ ] 事务锁顺序保持 Tenant → APIKey → Settlement。Key 扣费、租户扣费、请求日志、`usage_daily` 在同一事务提交。
-- [ ] 调用前足额预占；调用上游前先持久化 `dispatched`；上游已完成的调用不会因结算失败而重放；结果未知时继续占用额度。
+- [ ] `strict` 模式调用前足额预占、调用上游前先持久化 `dispatched`；`fast` 模式花费入队后才算完成，批次失败退回、按请求 ID 只扣一次；上游已完成的调用不会因结算失败而重放；结果未知时继续占用额度。
 - [ ] 显式 0 用量与缺失用量分开记录；估算的用量标明 `usage_source`。
 - [ ] 价格来自冻结的 `selling_quote` 快照；渠道 `price_overrides` / `price_multiplier` 规则不变；`ModelPrice` 停用时仍然拒绝。
 - [ ] 结算状态保持：reserved、pending、failed、uncertain、settled、released。

@@ -1,0 +1,244 @@
+{
+  "date_utc": "2026-11-14",
+  "cpu_count": 8,
+  "platform": "Linux-5.4.0-216-generic-x86_64-with-glibc2.31",
+  "conditions": "All three gateways, their databases, the synthetic upstream (5 ms) and the load generator on one 8-core host; same load generator (scripts.benchmark.measure), 64 concurrent, 4 load processes, 16 keys/users, default settings, spend tracking on",
+  "versions": {
+    "five_api": "0.5.0+ BILLING_MODE=fast, uvicorn --workers 8, MySQL 8, Redis 7",
+    "new_api": "calciumion/new-api:latest (v1.0.0-rc.51), MySQL 8, Redis 7",
+    "litellm": "litellm[proxy] 1.109.1, --num_workers 8, PostgreSQL 16, Redis 7"
+  },
+  "short_4000": {
+    "five_api": [
+      {
+        "workers": 8,
+        "requests": 4000,
+        "errors": 0,
+        "elapsed_seconds": 3.43,
+        "requests_per_second": 1164.5,
+        "p50_ms": 50.0,
+        "p95_ms": 85.54,
+        "p99_ms": 103.18,
+        "drain_seconds": 3.37,
+        "billing": {
+          "succeeded": 4000,
+          "success_logs": 4000,
+          "open_settlements": 0,
+          "ok": true
+        },
+        "speedup": 1.0
+      },
+      {
+        "workers": 8,
+        "requests": 4000,
+        "errors": 0,
+        "elapsed_seconds": 3.86,
+        "requests_per_second": 1037.1,
+        "p50_ms": 54.2,
+        "p95_ms": 92.1,
+        "p99_ms": 113.51,
+        "drain_seconds": 3.38,
+        "billing": {
+          "succeeded": 4000,
+          "success_logs": 4000,
+          "open_settlements": 0,
+          "ok": true
+        },
+        "speedup": 0.89
+      },
+      {
+        "workers": 8,
+        "requests": 4000,
+        "errors": 0,
+        "elapsed_seconds": 4.65,
+        "requests_per_second": 860.4,
+        "p50_ms": 43.39,
+        "p95_ms": 129.1,
+        "p99_ms": 249.49,
+        "drain_seconds": 3.62,
+        "billing": {
+          "succeeded": 4000,
+          "success_logs": 4000,
+          "open_settlements": 0,
+          "ok": true
+        },
+        "speedup": 0.74
+      }
+    ],
+    "new_api": [
+      {
+        "requests": 4000,
+        "errors": 0,
+        "elapsed_seconds": 5.19,
+        "requests_per_second": 770.1,
+        "p50_ms": 80.65,
+        "p95_ms": 96.73,
+        "p99_ms": 121.66
+      },
+      {
+        "requests": 4000,
+        "errors": 0,
+        "elapsed_seconds": 5.44,
+        "requests_per_second": 734.8,
+        "p50_ms": 84.23,
+        "p95_ms": 99.93,
+        "p99_ms": 122.66
+      },
+      {
+        "requests": 4000,
+        "errors": 0,
+        "elapsed_seconds": 5.29,
+        "requests_per_second": 756.8,
+        "p50_ms": 83.43,
+        "p95_ms": 93.35,
+        "p99_ms": 109.64
+      }
+    ],
+    "litellm": [
+      {
+        "requests": 4000,
+        "errors": 0,
+        "elapsed_seconds": 9.8,
+        "requests_per_second": 408.3,
+        "p50_ms": 137.06,
+        "p95_ms": 183.89,
+        "p99_ms": 212.08
+      },
+      {
+        "requests": 4000,
+        "errors": 0,
+        "elapsed_seconds": 8.61,
+        "requests_per_second": 464.7,
+        "p50_ms": 108.52,
+        "p95_ms": 251.91,
+        "p99_ms": 318.67
+      },
+      {
+        "requests": 4000,
+        "errors": 0,
+        "elapsed_seconds": 7.69,
+        "requests_per_second": 520.3,
+        "p50_ms": 120.47,
+        "p95_ms": 182.83,
+        "p99_ms": 218.86
+      }
+    ]
+  },
+  "sustained_20000_until_spend_logged": {
+    "five_api": [
+      {
+        "workers": 8,
+        "requests": 20000,
+        "errors": 0,
+        "elapsed_seconds": 21.59,
+        "requests_per_second": 926.3,
+        "p50_ms": 43.05,
+        "p95_ms": 134.01,
+        "p99_ms": 172.6,
+        "drain_seconds": 4.13,
+        "billing": {
+          "succeeded": 20000,
+          "success_logs": 20000,
+          "open_settlements": 0,
+          "ok": true
+        },
+        "speedup": 1.0,
+        "sustained_per_second": 777.6
+      },
+      {
+        "workers": 8,
+        "requests": 20000,
+        "errors": 0,
+        "elapsed_seconds": 20.61,
+        "requests_per_second": 970.2,
+        "p50_ms": 56.02,
+        "p95_ms": 87.35,
+        "p99_ms": 105.96,
+        "drain_seconds": 2.21,
+        "billing": {
+          "succeeded": 20000,
+          "success_logs": 20000,
+          "open_settlements": 0,
+          "ok": true
+        },
+        "speedup": 1.0,
+        "sustained_per_second": 876.4
+      },
+      {
+        "workers": 8,
+        "requests": 20000,
+        "errors": 0,
+        "elapsed_seconds": 17.63,
+        "requests_per_second": 1134.5,
+        "p50_ms": 47.6,
+        "p95_ms": 86.37,
+        "p99_ms": 106.29,
+        "drain_seconds": 4.88,
+        "billing": {
+          "succeeded": 20000,
+          "success_logs": 20000,
+          "open_settlements": 0,
+          "ok": true
+        },
+        "speedup": 1.0,
+        "sustained_per_second": 888.5
+      }
+    ],
+    "new_api": [
+      {
+        "requests": 20000,
+        "errors": 0,
+        "elapsed_seconds": 27.84,
+        "requests_per_second": 718.3,
+        "p50_ms": 87.29,
+        "p95_ms": 101.58,
+        "p99_ms": 115.44,
+        "gateway": "newapi",
+        "drain_seconds": 0.05,
+        "logged": 20000,
+        "sustained_per_second": 717.1
+      },
+      {
+        "requests": 20000,
+        "errors": 0,
+        "elapsed_seconds": 26.46,
+        "requests_per_second": 755.8,
+        "p50_ms": 83.04,
+        "p95_ms": 96.9,
+        "p99_ms": 105.76,
+        "gateway": "newapi",
+        "drain_seconds": 0.07,
+        "logged": 20000,
+        "sustained_per_second": 753.9
+      },
+      {
+        "requests": 20000,
+        "errors": 0,
+        "elapsed_seconds": 26.94,
+        "requests_per_second": 742.5,
+        "p50_ms": 84.85,
+        "p95_ms": 95.63,
+        "p99_ms": 104.44,
+        "gateway": "newapi",
+        "drain_seconds": 0.04,
+        "logged": 20000,
+        "sustained_per_second": 741.3
+      }
+    ],
+    "litellm": [
+      {
+        "requests": 20000,
+        "errors": 0,
+        "elapsed_seconds": 41.32,
+        "requests_per_second": 484.0,
+        "p50_ms": 114.61,
+        "p95_ms": 199.89,
+        "p99_ms": 242.7,
+        "gateway": "litellm",
+        "drain_seconds": 1.48,
+        "logged": 20000,
+        "sustained_per_second": 467.3
+      }
+    ]
+  }
+}

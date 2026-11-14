@@ -1,0 +1,103 @@
+{
+  "date_utc": "2026-11-14T02:25:41Z",
+  "channel": "DeepSeek Official",
+  "model": "deepseek-v4-flash",
+  "workers": 8,
+  "tenants": 4,
+  "stream": true,
+  "max_tokens": 64,
+  "requests_per_level": "concurrency x 4",
+  "levels": [
+    {
+      "concurrency": 10,
+      "direct": {
+        "requests": 40,
+        "ok": 40,
+        "errors": {},
+        "success_rate": 100.0,
+        "requests_per_minute": 204,
+        "first_token_p50_ms": 183,
+        "first_token_p95_ms": 5298,
+        "total_p50_ms": 1223,
+        "total_p95_ms": 6345
+      },
+      "gateway": {
+        "requests": 40,
+        "ok": 40,
+        "errors": {},
+        "success_rate": 100.0,
+        "requests_per_minute": 354,
+        "first_token_p50_ms": 250,
+        "first_token_p95_ms": 317,
+        "total_p50_ms": 1234,
+        "total_p95_ms": 1541
+      }
+    },
+    {
+      "concurrency": 20,
+      "direct": {
+        "requests": 80,
+        "ok": 80,
+        "errors": {},
+        "success_rate": 100.0,
+        "requests_per_minute": 892,
+        "first_token_p50_ms": 140,
+        "first_token_p95_ms": 285,
+        "total_p50_ms": 1109,
+        "total_p95_ms": 1377
+      },
+      "gateway": {
+        "requests": 80,
+        "ok": 80,
+        "errors": {},
+        "success_rate": 100.0,
+        "requests_per_minute": 848,
+        "first_token_p50_ms": 244,
+        "first_token_p95_ms": 464,
+        "total_p50_ms": 1238,
+        "total_p95_ms": 1604
+      }
+    },
+    {
+      "concurrency": 50,
+      "direct": {
+        "requests": 200,
+        "ok": 200,
+        "errors": {},
+        "success_rate": 100.0,
+        "requests_per_minute": 1341,
+        "first_token_p50_ms": 140,
+        "first_token_p95_ms": 7458,
+        "total_p50_ms": 1128,
+        "total_p95_ms": 8419
+      },
+      "gateway": {
+        "requests": 200,
+        "ok": 200,
+        "errors": {},
+        "success_rate": 100.0,
+        "requests_per_minute": 627,
+        "first_token_p50_ms": 4266,
+        "first_token_p95_ms": 8553,
+        "total_p50_ms": 5212,
+        "total_p95_ms": 9597
+      }
+    }
+  ],
+  "billing": {
+    "requests_sent": 320,
+    "request_logs": 320,
+    "success_logs": 320,
+    "settled": 0,
+    "open_settlements": 0,
+    "failed_charged_usd": "0",
+    "prompt_tokens": 12160,
+    "completion_tokens": 20478,
+    "usage_from_upstream": 320,
+    "cost_mismatches": 0,
+    "charged_usd": "0.028158",
+    "key_used_usd": "0.028158",
+    "tenant_used_usd": "0.028158",
+    "ok": true
+  }
+}

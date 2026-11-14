@@ -24,6 +24,7 @@ from tortoise import Tortoise
 
 from app.config import TORTOISE_ORM
 from app.models import APIKey, Channel, ModelPrice, RequestLog, Settlement, Tenant, UsageDaily
+from app.services import fast_billing
 from app.services.auth import hash_api_key
 from app.utils.secrets import channel_keys
 from scripts.benchmark import free_port, start, stop, wait_ready
@@ -102,7 +103,8 @@ def expected_cost(log, price) -> Decimal:
 async def billing_check(key_ids: list[int], tenant_ids: list[int], price, sent: int, gateway_ok: int) -> dict:
     """Every request settled once, failures cost nothing, successes cost exactly tokens x price."""
     deadline = time.monotonic() + 120
-    while await Settlement.filter(api_key_id__in=key_ids).exclude(state__in=("settled", "released")).exists():
+    while await Settlement.filter(api_key_id__in=key_ids).exclude(state__in=("settled", "released")).exists() \
+            or await fast_billing.backlog():
         if time.monotonic() > deadline:
             break
         await asyncio.sleep(0.5)
@@ -127,7 +129,8 @@ async def billing_check(key_ids: list[int], tenant_ids: list[int], price, sent: 
         "key_used_usd": str(key_used),
         "tenant_used_usd": str(tenant_used),
     }
-    result["ok"] = (result["request_logs"] == result["settled"] == sent and len(succeeded) == gateway_ok
+    accounted = result["settled"] == 0 if fast_billing.enabled() else result["settled"] == sent
+    result["ok"] = (result["request_logs"] == sent and accounted and len(succeeded) == gateway_ok
                     and result["open_settlements"] == 0 and not result["cost_mismatches"]
                     and Decimal(result["failed_charged_usd"]) == 0
                     and key_used == charged == tenant_used)

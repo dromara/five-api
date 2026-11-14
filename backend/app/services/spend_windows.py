@@ -32,11 +32,21 @@ return 1
 
 
 async def record_settlement_spend(request_id: str, key_id: int, tenant_id: int, cost: Decimal, when: datetime):
+    await record_settlement_spends([(request_id, key_id, tenant_id, cost, when)])
+
+
+async def record_settlement_spends(entries: list[tuple[str, int, int, Decimal, datetime]]) -> None:
+    """Each entry is (request_id, key_id, tenant_id, cost, when); one round trip for all of them."""
+    if not entries:
+        return
     r = await dependencies.get_redis()
-    hour = int(when.timestamp() // 3600)
-    await r.eval(SETTLEMENT_SPEND_SCRIPT, 3, f"five:settled:{request_id}",
-                 _bucket("key", key_id, hour), _bucket("team", tenant_id, hour),
-                 max(0, int(cost * MICRO)), BUCKET_TTL)
+    pipe = r.pipeline(transaction=False)
+    for request_id, key_id, tenant_id, cost, when in entries:
+        hour = int(when.timestamp() // 3600)
+        pipe.eval(SETTLEMENT_SPEND_SCRIPT, 3, f"five:settled:{request_id}",
+                  _bucket("key", key_id, hour), _bucket("team", tenant_id, hour),
+                  max(0, int(cost * MICRO)), BUCKET_TTL)
+    await pipe.execute()
 
 
 def normalize_limits(value) -> dict[str, float]:

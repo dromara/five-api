@@ -6,6 +6,8 @@ from contextlib import ExitStack
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest-only-0123456789")
 os.environ.setdefault("ENCRYPTION_KEY", "test-upstream-encryption-only-0123456789abcd")
+# Gateway subprocesses started by integration tests inherit this.
+os.environ.setdefault("BILLING_MODE", "strict")
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -45,6 +47,7 @@ class FakeRedis:
         self.data = {}
         self.hashes: dict[str, dict[str, int]] = {}
         self.zsets = {}
+        self.lists: dict[str, list] = {}
 
     async def hgetall(self, key):
         return self.hashes.get(key, {}).copy()
@@ -55,6 +58,15 @@ class FakeRedis:
     async def eval(self, script, numkeys, *keys_and_args):
         key = keys_and_args[0]
         args = keys_and_args[int(numkeys):]
+        if "LPOP" in script and "RPUSH" in script:
+            items = await self.lpop(key, int(args[0])) or []
+            if items:
+                await self.rpush(keys_and_args[1], *items)
+            return items
+        if "LRANGE" in script:
+            items = self.lists.pop(keys_and_args[1], [])
+            self.lists[key] = items + self.lists.get(key, [])
+            return len(items)
         if "settlement_spend_v1" in script:
             if key in self.data:
                 return 0
@@ -148,7 +160,7 @@ class FakeRedis:
         return True
 
     async def delete(self, *keys):
-        return sum(self.data.pop(key, None) is not None for key in keys)
+        return sum((self.data.pop(key, None) is not None) | (self.lists.pop(key, None) is not None) for key in keys)
 
     async def exists(self, *keys):
         return sum(key in self.data for key in keys)
@@ -173,6 +185,64 @@ class FakeRedis:
 
     async def ttl(self, key):
         return 30 if key in self.data else -2
+
+    async def decrby(self, key, amount):
+        return await self.incrby(key, -int(amount))
+
+    async def rpush(self, key, *values):
+        self.lists.setdefault(key, []).extend(values)
+        return len(self.lists[key])
+
+    async def lpush(self, key, *values):
+        items = self.lists.setdefault(key, [])
+        for value in values:
+            items.insert(0, value)
+        return len(items)
+
+    async def lpop(self, key, count=None):
+        items = self.lists.get(key, [])
+        if not items:
+            return None
+        if count is None:
+            return items.pop(0)
+        popped, self.lists[key] = items[:count], items[count:]
+        return popped
+
+    async def llen(self, key):
+        return len(self.lists.get(key, []))
+
+    async def scan_iter(self, match="*"):
+        import fnmatch
+        for key in list(self.data) + list(self.lists):
+            if fnmatch.fnmatchcase(key, match):
+                yield key
+
+    def pipeline(self, transaction=True):
+        return FakePipeline(self)
+
+
+class FakePipeline:
+    def __init__(self, redis: FakeRedis):
+        self.redis, self.calls = redis, []
+
+    def __getattr__(self, name):
+        def queue(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return self
+        return queue
+
+    async def execute(self):
+        calls, self.calls = self.calls, []
+        return [await getattr(self.redis, name)(*args, **kwargs) for name, args, kwargs in calls]
+
+
+@pytest.fixture(autouse=True)
+def billing_mode(request):
+    """Most tests assert synchronous settlement; tests marked fast_billing exercise the queued path."""
+    from app.config import settings
+    mode = "fast" if request.node.get_closest_marker("fast_billing") else "strict"
+    with patch.object(settings, "BILLING_MODE", mode):
+        yield mode
 
 
 @pytest.fixture(autouse=True)

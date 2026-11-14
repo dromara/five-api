@@ -23,8 +23,10 @@ from uuid import uuid4
 import httpx
 from tortoise import Tortoise
 
-from app.config import TORTOISE_ORM
+from app.config import TORTOISE_ORM, settings
+from app.dependencies import close_redis, get_redis
 from app.models import APIKey, Channel, ModelPrice, ModelProbe, RequestLog, Settlement, Tenant, UsageDaily
+from app.services import fast_billing
 from app.services.auth import hash_api_key
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,26 +125,28 @@ def measure(pool, clients, url, body, headers, requests, concurrency):
             "p99_ms": percentile(durations, .99)}
 
 
-async def settled(key_ids: list[int], timeout: float = 30) -> None:
-    deadline = time.monotonic() + timeout
-    while await Settlement.filter(api_key_id__in=key_ids).exclude(state__in=("settled", "released")).exists():
-        if time.monotonic() > deadline:
-            return
-        await asyncio.sleep(0.2)
+async def settled(key_ids: list[int], timeout: float = 120) -> float:
+    """Seconds until open settlements and the fast-billing queue are both empty."""
+    begin = time.monotonic()
+    while await Settlement.filter(api_key_id__in=key_ids).exclude(state__in=("settled", "released")).exists() \
+            or await fast_billing.backlog():
+        if time.monotonic() - begin > timeout:
+            break
+        await asyncio.sleep(0.1)
+    return round(time.monotonic() - begin, 2)
 
 
 async def key_totals(key_ids: list[int]) -> Decimal:
     return sum(await APIKey.filter(id__in=key_ids).values_list("quota_used", flat=True), Decimal(0))
 
 
-async def billed_exactly_once(key_ids: list[int], before: Decimal) -> dict:
-    """Every successful request settled once and the key totals grew by exactly the logged charges."""
+async def billed_exactly_once(key_ids: list[int], before: Decimal, succeeded: int) -> dict:
+    """Every successful request was logged once and the key totals grew by exactly the logged charges."""
     logs = await RequestLog.filter(api_key_id__in=key_ids, status_code=200).count()
     charged = sum(await RequestLog.filter(api_key_id__in=key_ids).values_list("cost", flat=True), Decimal(0))
-    settled = await Settlement.filter(api_key_id__in=key_ids, state="settled").count()
     open_states = await Settlement.filter(api_key_id__in=key_ids).exclude(state__in=("settled", "released")).count()
-    return {"settled": settled, "success_logs": logs, "open_settlements": open_states,
-            "ok": settled == logs and open_states == 0 and await key_totals(key_ids) - before == charged}
+    return {"succeeded": succeeded, "success_logs": logs, "open_settlements": open_states,
+            "ok": logs == succeeded and open_states == 0 and await key_totals(key_ids) - before == charged}
 
 
 async def main():
@@ -204,8 +208,9 @@ async def main():
                 await RequestLog.filter(api_key_id__in=key_ids).delete()
                 await Settlement.filter(api_key_id__in=key_ids).delete()
                 result = measure(pool, args.clients, url, body, auth, args.requests, args.concurrency)
-                await settled(key_ids)
-                result = {"workers": count, **result, "billing": await billed_exactly_once(key_ids, before)}
+                drain_seconds = await settled(key_ids)
+                billing = await billed_exactly_once(key_ids, before, result["requests"] - result["errors"])
+                result = {"workers": count, **result, "drain_seconds": drain_seconds, "billing": billing}
             finally:
                 stop(gateway)
             runs.append(result)
@@ -213,7 +218,8 @@ async def main():
         base = runs[0]["requests_per_second"]
         for run in runs:
             run["speedup"] = round(run["requests_per_second"] / base, 2)
-        report = {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "version": "0.4.0",
+        report = {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "version": "0.6.0",
+                  "billing_mode": settings.BILLING_MODE,
                   "python": platform.python_version(), "platform": platform.platform(), "cpu_count": os.cpu_count(),
                   "tenants": args.tenants, "concurrency": args.concurrency, "requests": args.requests,
                   "upstream_delay_ms": args.upstream_ms, "load_processes": args.clients,
@@ -240,6 +246,11 @@ async def main():
             await price.delete()
         if tenant_ids:
             await Tenant.filter(id__in=tenant_ids).delete()
+        counters = [fast_billing.pending_key("key", key_id) for key_id in key_ids] + \
+                   [fast_billing.pending_key("tenant", tenant_id) for tenant_id in tenant_ids]
+        if counters:
+            await (await get_redis()).delete(*counters)
+        await close_redis()
         await Tortoise.close_connections()
         stop(origin)
 

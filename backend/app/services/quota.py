@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from tortoise.expressions import F
 
 from app.models import APIKey, Tenant
-from app.services import settlements
+from app.services import fast_billing, settlements
 from app.services.auth import key_tenant
 from app.services.billing_quotes import snapshot_quotes, estimate_quotes
 from app.services.concurrency import concurrency_limiter
@@ -56,7 +56,7 @@ async def deduct_quota(api_key_id: int, cost: Decimal) -> None:
 
 
 async def occupied_quota(scope: str, owner_id: int) -> Decimal:
-    return await settlements.occupied(scope, owner_id)
+    return await settlements.occupied(scope, owner_id) + await fast_billing.pending(scope, owner_id)
 
 
 class RequestLease:
@@ -93,6 +93,8 @@ class RequestLease:
             await self._clear(self.estimated_tokens if self.dispatched else None)
 
     async def before_send(self):
+        if not self.reserved:
+            self.dispatched = True
         if not self.dispatched:
             try:
                 await settlements.mark_dispatched(self.request_id)
@@ -131,12 +133,13 @@ async def begin_request_budget(api_key: APIKey, request_id: str, body: dict | No
     if input_tokens_override is not None:
         input_tokens = input_tokens_override
     lease.estimated_input = input_tokens
+    fast = fast_billing.enabled()
     try:
         for scope, owner in (("key", api_key), ("tenant", tenant)):
             limits = normalize_limits(owner.window_limits)
             if not limits:
                 continue
-            held = await settlements.occupied(scope, owner.id)
+            held = Decimal(0) if fast else await settlements.occupied(scope, owner.id)
             # Preserve the existing Redis namespace when evolving Team into Tenant.
             window = await exceeded_window("team" if scope == "tenant" else scope, owner.id, limits, held)
             if window:
@@ -151,11 +154,16 @@ async def begin_request_budget(api_key: APIKey, request_id: str, body: dict | No
         await rate_limiter.reserve_tpm(tenant.id, tenant.tpm_limit, tokens, scope="tenant")
         if tenant.tpm_limit != -1:
             lease.tenant_tpm_reserved = tokens
-        try:
-            await settlements.reserve(lease.request_id, api_key, estimate, lease.quotes)
-        except settlements.BudgetDenied as exc:
-            raise QuotaExceeded(api_key.id, exc.scope)
-        lease.reserved = True
+        if fast:
+            scope = await fast_billing.over_budget(api_key, tenant)
+            if scope:
+                raise QuotaExceeded(api_key.id, scope)
+        else:
+            try:
+                await settlements.reserve(lease.request_id, api_key, estimate, lease.quotes)
+            except settlements.BudgetDenied as exc:
+                raise QuotaExceeded(api_key.id, exc.scope)
+            lease.reserved = True
         lease.tenant_lease_id = await concurrency_limiter.acquire(tenant.id, tenant.concurrent_limit, scope="tenant")
     except BaseException:
         await lease.release()

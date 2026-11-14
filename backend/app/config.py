@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     MYSQL_POOL_SIZE: int = 0
     # A worker whose heartbeat is older than this is treated as exited.
     PROCESS_STALE_SECONDS: int = 60
+    # fast: admit against cached spend and write charges to MySQL in batches; concurrent requests can overspend.
+    # strict: reserve the full estimate under SQL row locks before calling the upstream.
+    BILLING_MODE: str = "fast"
 
     REDIS_URL: str = "redis://127.0.0.1:6379/0"
 

@@ -25,13 +25,13 @@
 
 Five API 是一个多租户 AI 网关。你接入 OpenAI、Claude、Gemini、DeepSeek、通义千问等上游，给每个租户开户、分配美元额度；租户自己创建 Key，只能花自己的额度，每一次调用都按实际服务的渠道精确记账。
 
-- **对外转售**：租户是你的客户。足额预占不超卖，缺价不放行，逐笔可对账。
+- **对外转售**：租户是你的客户。缺价不放行，逐笔可对账；要求余额一分都不能超时切到严格模式。
 - **企业内部**：租户是部门、团队或项目。部门预算与成本分摊、限流、请求审计与泄密排查。
 
 ## 为什么选 Five API
 
-- **每一笔都对得上**：先足额预占再调上游，扣费和日志同一事务提交。真实 DeepSeek 渠道 320 笔流式请求逐笔重算，**0 笔不一致**。
-- **几乎不增加延迟**：真实渠道下首字只比直连慢 **6–19 毫秒**；8 核机器每分钟可处理约 **2.6 万次**请求。
+- **每一笔都对得上**：扣费和日志同一事务提交，按请求号去重，不漏记也不重复扣。真实 DeepSeek 渠道 320 笔流式请求逐笔重算，**0 笔不一致**。
+- **几乎不增加延迟**：真实渠道下首字只比直连慢 **6–19 毫秒**；8 核机器每分钟可处理约 **6 万次**请求。
 - **Claude Code、Codex 实测可用**：改一个地址就能让团队的编码 Agent 走你的额度和审计。
 - **企业功能全部开源**：租户自管 Key、IP 白名单、请求审计、AI 泄密审查都在 MIT 版本里，`./service.sh deploy` 一条命令起来。
 
@@ -57,29 +57,32 @@ OpenAI SDK 把 `base_url` 改成 `http://服务器IP:8080/v1`，Anthropic SDK �
 ## 功能
 
 <details open>
-<summary><b>精确计费</b> - 先占住钱再放行，每一笔都能对上</summary>
+<summary><b>精确计费</b> - 每一笔都能对上，余额管控松紧可选</summary>
 
 <br>
 
-- **先足额预占，再调上游**：按输入加最大输出估算费用，在 MySQL 行锁事务里连同所有在途请求核对 Key 和租户余额，够才放行。多进程、多 Key 并发打同一个租户，也不会一起越过余额；记账不可用时直接拒绝，不先放行后补账。
+- **两种计费模式**（`BILLING_MODE`）：
+  - 默认 `fast`：和 LiteLLM 一样先放行，余额只看已入库花费加 Redis 里待入库的花费，不加锁；花费进 Redis 队列，后台每 0.5 秒整批写入 MySQL。吞吐约为严格模式的 2.5 倍，但同一时刻并发的请求可能一起越过余额，超出部分照实扣费。
+  - `strict`：先足额预占再调上游。按输入加最大输出估算费用，在 MySQL 行锁事务里连同所有在途请求核对 Key 和租户余额，够才放行；多进程、多 Key 并发打同一个租户也不会一起越过余额，记账不可用时直接拒绝。
 - **没配价格不放行**：模型没配售价时拒绝请求，不按 0 记账；只有显式填 0 才免费。
 - **价格在请求前锁定**：中途调价不影响已发出的请求。
 - **扣费、日志同一事务**：Key 扣费、租户扣费、请求日志、日用量要么都写入，要么都不写；记账失败后台恢复且只恢复一次，上游结果未知的请求继续占着额度等人工核对。
 - **断流也计费**：客户端中途断开按已转发内容计费；上游没返回用量时按内容估算并标明来源。
 - **四档计价**：输入、缓存读、缓存写、输出分别计价，图片、语音、视频可按次计价。
 
-实际用量超出预估时照实扣费、不会少收，余额可能出现一次请求范围内的小额负数（例如没设 `max_tokens` 却输出超过 4096 token）。每条保证都有自动化测试，CI 每次提交都跑：
+严格模式下实际用量超出预估时照实扣费、不会少收，余额可能出现一次请求范围内的小额负数（例如没设 `max_tokens` 却输出超过 4096 token）。每条保证都有自动化测试，CI 每次提交都跑：
 
 | 保证 | 测试 |
 | --- | --- |
-| 用量在预估内时，预占覆盖每一笔扣费；多进程共享余额不超卖 | `test_end_to_end_charge_never_exceeds_the_reservation`、`test_two_workers_never_overspend_a_shared_tenant_budget` |
+| 严格模式：用量在预估内时，预占覆盖每一笔扣费；多进程共享余额不超卖 | `test_end_to_end_charge_never_exceeds_the_reservation`、`test_two_workers_never_overspend_a_shared_tenant_budget` |
+| 默认模式：待入库花费计入余额；写库失败或进程退出后整批退回，恰好扣一次 | `tests/test_fast_billing.py` |
 | 缺价不放行、不按 0 计 | `test_unpriced_model_does_not_reach_upstream`、`test_selling_quote_never_silently_prices_at_zero` |
 | 价格锁定 | `test_selling_price_is_snapshotted_before_the_upstream_call` |
 | 记账失败恰好恢复一次，结果未知继续占额度 | `test_accounting_rolls_back_and_recovers_exactly_once`、`test_timeout_keeps_unknown_work_occupied` |
 | 断流计费、不重放上游 | `test_real_http_stream_and_client_cancellation_releases_leases`、`test_disconnect_after_first_byte_does_not_replay_upstream` |
 
 ```bash
-cd backend && ../.venv/bin/pytest -q tests/test_billing_invariants.py tests/test_billing_reliability.py
+cd backend && ../.venv/bin/pytest -q tests/test_billing_invariants.py tests/test_billing_reliability.py tests/test_fast_billing.py
 ```
 
 设计细节见 [为什么我们的计费不会漏钱](docs/articles/why-billing-does-not-leak.md)。
@@ -202,8 +205,9 @@ Cursor 需要公网 HTTPS 网关，尚未实测。完整说明和常见问题见
 | | Five API | [new-api](https://github.com/QuantumNous/new-api) | [LiteLLM](https://github.com/BerriAI/litellm) |
 |---|---|---|---|
 | 定位 | 平台开户，按客户或部门分账 | 公开中转站，自助注册、在线充值 | 企业内部出口，100+ 供应商 |
-| 预扣费 | 输入加输出上限足额预占，MySQL 事务核对 | 只预扣估算输入；余额超 10 美元跳过预扣 | 依赖 Redis，硬上限需另开 fail-closed |
+| 预扣费 | 默认不预扣，按已用加待入库花费放行；`strict` 模式输入加输出上限足额预占，MySQL 事务核对 | 只预扣估算输入；余额超 10 美元跳过预扣 | 不预扣，依赖 Redis，硬上限需另开 fail-closed |
 | 未配置价格 | 拒绝请求 | 返回价格错误 | 放行，按 0 记账 |
+| 同机吞吐（默认配置，[实测](docs/BENCHMARK.md)） | 每分钟 4.7–5.3 万次 | 4.3–4.5 万次 | 2.8 万次 |
 | 请求内容审计 | 按 Key 保存，密钥扫描，AI 审查出报告 | 日志不保存请求内容，管理员查看提问的需求标为[无计划](https://github.com/QuantumNous/new-api/issues/7609) | 可开启保存 prompt；密钥检测属[企业版](https://docs.litellm.ai/docs/enterprise) |
 | 租户自管 Key、IP 白名单 | MIT 版本包含 | 支持 | 团队管理员、IP 白名单属企业版 |
 | 模型质量检测 | 健康检测 + 降智参考检测 | 连通性和响应时间 | 连通性 |
@@ -218,10 +222,12 @@ Cursor 需要公网 HTTPS 网关，尚未实测。完整说明和常见问题见
 
 | 测试 | 结果 |
 |---|---|
-| 模拟环境处理上限 | 多个租户合计每分钟约 2.6 万次（8 个进程）；单个租户约 9000 次 |
+| 模拟环境处理上限，默认模式 | 每分钟约 6 万次（4–8 个进程），单个租户也一样；算上后台写库，持续约 3.5–4.7 万次 |
+| 同机对比，算上后台写库 | Five API 每分钟 4.7–5.3 万次，new-api 4.3–4.5 万次，LiteLLM 2.8 万次；p50 延迟分别约 50、85、115 毫秒 |
+| 模拟环境处理上限，`strict` 模式 | 多个租户合计每分钟约 2.4 万次；单个租户约 8400 次 |
 | 真实 DeepSeek，同时 10–50 个流式请求 | 全部成功，首字只比直连慢 6–19 毫秒 |
 
-单个租户的请求要经过同一行锁，这是余额精确的代价。测试条件、原始数据和重跑命令见 [压测报告](docs/BENCHMARK.md)。
+`strict` 模式下单个租户的请求要经过同一行锁，这是余额一分不超的代价。测试条件、原始数据和重跑命令见 [压测报告](docs/BENCHMARK.md)。
 
 ## 部署与运维
 
@@ -234,6 +240,7 @@ Cursor 需要公网 HTTPS 网关，尚未实测。完整说明和常见问题见
 | `SECRET_KEY` | 登录令牌密钥；不填时每次重启登录失效 |
 | `ENCRYPTION_KEY` | 上游 Key 的加密密钥；不填时用内置公开密钥加密，已有渠道后再设置须先迁移 |
 | `WORKERS` | 进程数，默认按 CPU 核数，最多 8 |
+| `BILLING_MODE` | `fast`（默认，先放行、批量入库，并发时可能超出余额）或 `strict`（足额预占，余额不超） |
 | `ports` | 默认对外 8080 |
 
 <details>

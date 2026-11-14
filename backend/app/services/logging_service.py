@@ -8,14 +8,14 @@ from tortoise.transactions import in_transaction
 
 from app.models import RequestLog, RequestLogAudit
 from app.services.metrics import record_request_metrics
-from app.services.usage_stats import record_daily_usage, _record_minute
+from app.services.usage_stats import record_daily_totals, record_daily_usage, record_minutes, _record_minute
 from app.services.redaction import redact
 from app.services.request_context import client_request_id as correlation_id
 
 logger = logging.getLogger(__name__)
 
 
-async def save_request_log(
+def _build_log(
     request_id: str,
     api_key_id: int,
     api_key_name: str,
@@ -48,87 +48,110 @@ async def save_request_log(
     client_request_id: str = "",
     usage_source: str = "upstream",
     observed_at: str | None = None,
-    observe: bool = True,
-) -> RequestLog:
+) -> tuple[RequestLog, str]:
+    """An unsaved log row and its redacted audit text."""
     try:
         audit_request = json.dumps(redact(json.loads(audit_request)), ensure_ascii=False) if audit_request else ""
     except (ValueError, TypeError):
         audit_request = redact(audit_request)
-    has_audit = bool(audit_request)
-    async with in_transaction():
-        log = await RequestLog.create(
-            request_id=request_id,
-            client_request_id=client_request_id or correlation_id.get(),
-            usage_source=usage_source,
-            created_at=datetime.fromisoformat(observed_at) if observed_at else datetime.now(timezone.utc),
-            api_key_id=api_key_id,
-            tenant_id=tenant_id,
-            api_key_name=api_key_name,
-            channel_id=channel_id,
-            channel_name=channel_name,
-            model_requested=model_requested,
-            model_actual=model_actual,
-            provider=provider,
-            endpoint=endpoint,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-            cached_tokens=cached_tokens,
-            cache_write_tokens=cache_write_tokens,
-            cost=cost,
-            is_stream=is_stream,
-            status_code=status_code,
-            latency_ms=latency_ms,
-            error_message=redact(error_message),
-            error_origin=error_origin,
-            upstream_status_code=upstream_status_code,
-            upstream_error=redact(upstream_error),
-            ip_address=ip_address,
-            failed_over=failed_over,
-            has_audit=has_audit,
-            security_hit=security_hit[:128],
-            session_id=session_id[:32],
-            cache_savings=cache_savings,
-            cost_detail=cost_detail,
-        )
-        if has_audit:
-            await RequestLogAudit.create(
-                request_log=log,
-                audit_request=audit_request,
-            )
+    log = RequestLog(
+        request_id=request_id,
+        client_request_id=client_request_id or correlation_id.get(),
+        usage_source=usage_source,
+        created_at=datetime.fromisoformat(observed_at) if observed_at else datetime.now(timezone.utc),
+        api_key_id=api_key_id,
+        tenant_id=tenant_id,
+        api_key_name=api_key_name,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        model_requested=model_requested,
+        model_actual=model_actual,
+        provider=provider,
+        endpoint=endpoint,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        cached_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
+        cost=cost,
+        is_stream=is_stream,
+        status_code=status_code,
+        latency_ms=latency_ms,
+        error_message=redact(error_message),
+        error_origin=error_origin,
+        upstream_status_code=upstream_status_code,
+        upstream_error=redact(upstream_error),
+        ip_address=ip_address,
+        failed_over=failed_over,
+        has_audit=bool(audit_request),
+        security_hit=security_hit[:128],
+        session_id=session_id[:32],
+        cache_savings=cache_savings,
+        cost_detail=cost_detail,
+    )
+    return log, audit_request
 
-        await record_daily_usage(
-            api_key_id=api_key_id,
-            api_key_name=api_key_name,
-            tenant_id=tenant_id,
-            model=model_requested,
-            channel_id=channel_id,
-            channel_name=channel_name,
-            status_code=status_code,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            cost=cost,
-            cached_tokens=cached_tokens,
-            cache_write_tokens=cache_write_tokens,
-            cache_savings=cache_savings,
-            when=log.created_at, realtime=False,
-        )
+
+async def save_request_log(*, observe: bool = True, **fields) -> RequestLog:
+    log, audit_request = _build_log(**fields)
+    async with in_transaction():
+        await log.save()
+        if audit_request:
+            await RequestLogAudit.create(request_log=log, audit_request=audit_request)
+        await record_daily_usage(**_daily_fields(log), when=log.created_at, realtime=False)
     if observe:
         await observe_request_log(log)
     return log
 
 
+async def save_request_logs(batch: list[dict]) -> list[RequestLog]:
+    """Insert many logs at once; the caller provides the transaction and observes them after commit."""
+    built = [_build_log(**fields) for fields in batch]
+    plain = [log for log, audit_request in built if not audit_request]
+    if plain:
+        await RequestLog.bulk_create(plain)
+    for log, audit_request in built:
+        if audit_request:
+            await log.save()
+            await RequestLogAudit.create(request_log=log, audit_request=audit_request)
+    await record_daily_totals([(_daily_fields(log), log.created_at) for log, _ in built])
+    return [log for log, _ in built]
+
+
+def _daily_fields(log: RequestLog) -> dict:
+    return dict(
+        api_key_id=log.api_key_id, api_key_name=log.api_key_name, tenant_id=log.tenant_id,
+        model=log.model_requested, channel_id=log.channel_id, channel_name=log.channel_name,
+        status_code=log.status_code, prompt_tokens=log.prompt_tokens, completion_tokens=log.completion_tokens,
+        cost=Decimal(str(log.cost)), cached_tokens=log.cached_tokens, cache_write_tokens=log.cache_write_tokens,
+        cache_savings=Decimal(str(log.cache_savings)),
+    )
+
+
 async def observe_request_log(log: RequestLog) -> None:
     try:
         await _record_minute(log.created_at)
-        record_request_metrics(
-            model=log.model_actual or log.model_requested, provider=log.provider,
-            channel_name=log.channel_name, status_code=log.status_code, endpoint=log.endpoint,
-            prompt_tokens=log.prompt_tokens, completion_tokens=log.completion_tokens,
-            cached_tokens=log.cached_tokens, cost=float(log.cost), latency_seconds=log.latency_ms / 1000.0,
-        )
+        _record_metrics(log)
     except Exception:
         logger.exception("Post-commit observation failed for request %s", log.request_id)
+
+
+async def observe_request_logs(logs: list[RequestLog]) -> None:
+    try:
+        await record_minutes([log.created_at for log in logs])
+        for log in logs:
+            _record_metrics(log)
+    except Exception:
+        logger.exception("Post-commit observation failed for %d requests", len(logs))
+
+
+def _record_metrics(log: RequestLog) -> None:
+    record_request_metrics(
+        model=log.model_actual or log.model_requested, provider=log.provider,
+        channel_name=log.channel_name, status_code=log.status_code, endpoint=log.endpoint,
+        prompt_tokens=log.prompt_tokens, completion_tokens=log.completion_tokens,
+        cached_tokens=log.cached_tokens, cost=float(log.cost), latency_seconds=log.latency_ms / 1000.0,
+    )
 
 
 async def cleanup_old_logs(days: int | None = None) -> int:

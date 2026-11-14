@@ -1,6 +1,8 @@
 # 为什么我们的计费不会漏钱：一个多租户 AI 网关的记账设计
 
 > 适合发布到 V2EX、LINUX DO 等社区。项目地址：https://github.com/timmy1688/five-api（MIT）
+>
+> 本文讲的是 `BILLING_MODE=strict` 严格模式。0.5.0 之后默认是 `fast` 模式，和 LiteLLM 一样先放行、花费后台批量入库，吞吐更高，但并发请求可能一起越过余额，见 [设计文档](../DESIGN.md)。
 
 做 AI 接口转售，或者给公司各部门分 AI 预算的朋友，应该都遇到过这几种事：
 

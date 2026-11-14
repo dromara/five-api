@@ -80,17 +80,48 @@ async def record_daily_usage(
         await _record_minute(when)
 
 
-async def _record_minute(when: datetime) -> None:
+async def record_daily_totals(entries: list[tuple[dict, datetime]]) -> None:
+    """record_daily_usage for many requests, one upsert per day, key, model and channel."""
+    groups: dict[tuple, list] = {}
+    for fields, when in entries:
+        group = (when.date().isoformat(), fields["api_key_id"], fields["model"][:64], fields["channel_id"] or 0)
+        prompt, completion = fields["prompt_tokens"], fields["completion_tokens"]
+        values = [1, 1 if fields["status_code"] >= 400 else 0, prompt, completion, prompt + completion,
+                  fields["cost"], fields["cached_tokens"], fields["cache_write_tokens"], fields["cache_savings"]]
+        row = groups.get(group)
+        if row is None:
+            groups[group] = [fields["api_key_name"][:128], fields["tenant_id"] or 0,
+                             fields["channel_name"][:128], values]
+        else:
+            row[3] = [total + value for total, value in zip(row[3], values)]
+    conn = connections.get("default")
+    sql = _upsert_sql(conn.capabilities.dialect)
+    for (day, api_key_id, model, channel_id), (key_name, tenant_id, channel_name, sums) in groups.items():
+        sums = [str(value) if isinstance(value, Decimal) else value for value in sums]
+        await conn.execute_query(sql, [day, api_key_id, key_name, tenant_id, model, channel_id, channel_name, *sums])
+
+
+async def _record_minute(when: datetime, requests: int = 1) -> None:
     """Per-minute request count in Redis, keeping the busiest minute of each day."""
     r = await dependencies.get_redis()
     minute_key = f"{MINUTE_PREFIX}{when:%Y%m%d%H%M}"
-    count = await r.incr(minute_key)
-    if count == 1:
+    count = await r.incrby(minute_key, requests)
+    if count == requests:
         await r.expire(minute_key, 7200)
     peak_key = f"{PEAK_PREFIX}{when:%Y%m%d}"
     current = await r.get(peak_key)
     if current is None or count > int(current):
         await r.set(peak_key, count, ex=PEAK_TTL)
+
+
+async def record_minutes(times: list[datetime]) -> None:
+    minutes: dict[str, tuple[datetime, int]] = {}
+    for when in times:
+        label = f"{when:%Y%m%d%H%M}"
+        first, count = minutes.get(label, (when, 0))
+        minutes[label] = (first, count + 1)
+    for when, count in minutes.values():
+        await _record_minute(when, count)
 
 
 async def peak_rpm(days: int) -> int:
