@@ -2,7 +2,7 @@ from fastapi import HTTPException
 
 from app.models import APIKey, ModelGroup
 from app.services.auth import key_tenant
-from app.services.quota import check_quota
+from app.services.quota import check_quota, exhausted
 from app.services.rate_limit import RPMExceeded, rate_limiter
 
 
@@ -16,7 +16,7 @@ def openai_error(status_code: int, error_type: str, code: str, message: str):
 def anthropic_error(status_code: int, error_type: str, code: str, message: str):
     raise HTTPException(
         status_code=status_code,
-        detail={"type": "error", "error": {"type": error_type, "message": message}},
+        detail={"type": "error", "error": {"type": error_type, "message": message, "code": code}},
     )
 
 
@@ -46,6 +46,8 @@ async def check_model_access(api_key: APIKey, model: str, raise_error=openai_err
 async def run_pre_checks(api_key: APIKey, model: str, raise_error=openai_error) -> None:
     """统一前置检查管线：quota → model_access → RPM。"""
     if not await check_quota(api_key):
-        raise_error(429, "rate_limit_error", "quota_exceeded", "Spending quota exceeded")
+        tenant = await key_tenant(api_key)
+        refused = await exhausted(api_key, tenant.name if tenant else "", "key")
+        raise_error(refused.status, "rate_limit_error", refused.code, refused.message)
 
     await check_model_access(api_key, model, raise_error)

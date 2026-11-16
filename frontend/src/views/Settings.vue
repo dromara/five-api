@@ -74,29 +74,6 @@
         </el-form-item>
 
 </el-collapse-item>
-              <el-collapse-item :title="t('settings.downgrade')" name="downgrade">        <el-form-item :label="t('settings.downgrade')">
-          <div class="fallback-list">
-            <div class="fallback-row">
-              <span class="threshold-label">{{ t('settings.downgradeThreshold') }}</span>
-              <el-input-number v-model="downgradeThreshold" :min="10" :max="100" :step="5" />
-              <span class="fallback-arrow">%</span>
-            </div>
-            <div v-for="(rule, index) in downgrades" :key="index" class="fallback-row">
-              <el-select v-model="rule.source" filterable allow-create default-first-option :placeholder="t('settings.downgradeSource')" class="fallback-source">
-                <el-option v-for="m in modelOptions" :key="m" :label="m" :value="m" />
-              </el-select>
-              <span class="fallback-arrow">→</span>
-              <el-select v-model="rule.target" filterable allow-create default-first-option :placeholder="t('settings.downgradeTarget')" class="fallback-source">
-                <el-option v-for="m in modelOptions" :key="m" :label="m" :value="m" :disabled="m === rule.source" />
-              </el-select>
-              <el-button text type="danger" @click="downgrades.splice(index, 1)">{{ t('common.delete') }}</el-button>
-            </div>
-            <el-button v-if="canWrite" plain size="small" @click="downgrades.push({ source: '', target: '' })">{{ t('settings.fallbackAdd') }}</el-button>
-          </div>
-          <p class="hint">{{ t('settings.downgradeHint') }}</p>
-        </el-form-item>
-
-</el-collapse-item>
             </el-collapse>
           </el-form>
           <div class="settings-footer"><span :class="{ changed: dirty }">{{ t(dirty ? 'settings.unsaved' : 'settings.upToDate') }}</span><el-button type="primary" :loading="saving" :disabled="!loaded || !dirty" @click="save">{{ t(activeTab === 'general' ? 'settings.saveGeneral' : 'settings.saveRouting') }}</el-button></div>
@@ -139,8 +116,6 @@ const form = reactive<GatewaySettings>({
   auto_cache_control: false,
 })
 const fallbacks = ref<{ source: string; targets: string[] }[]>([])
-const downgrades = ref<{ source: string; target: string }[]>([])
-const downgradeThreshold = ref(80)
 const modelOptions = ref<string[]>([])
 
 function apply(data: GatewaySettings, scope = 'all') {
@@ -155,8 +130,6 @@ function apply(data: GatewaySettings, scope = 'all') {
     form.sticky_session_ttl = data.sticky_session_ttl
     form.routing_strategy = data.routing_strategy ?? 'weighted'
     fallbacks.value = Object.entries(data.model_fallbacks ?? {}).map(([source, targets]) => ({ source, targets: [...targets] }))
-    downgradeThreshold.value = Math.round((data.budget_downgrade?.threshold ?? 0.8) * 100)
-    downgrades.value = Object.entries(data.budget_downgrade?.rules ?? {}).map(([source, target]) => ({ source, target }))
   }
 }
 
@@ -167,17 +140,7 @@ function payload(tab: string): Partial<GatewaySettings> {
   } : {
     sticky_session_enabled: form.sticky_session_enabled, sticky_session_ttl: form.sticky_session_ttl,
     routing_strategy: form.routing_strategy, model_fallbacks: fallbackMap(),
-    budget_downgrade: downgradeConfig(),
   }
-}
-
-function downgradeConfig() {
-  const rules: Record<string, string> = {}
-  for (const rule of downgrades.value) {
-    const source = rule.source.trim()
-    if (source && rule.target) rules[source] = rule.target
-  }
-  return { threshold: downgradeThreshold.value / 100, rules }
 }
 
 function fallbackMap(): Record<string, string[]> {
@@ -283,11 +246,6 @@ h4:not(:first-child) {
 .fallback-targets {
   flex: 1;
   min-width: 260px;
-}
-
-.threshold-label {
-  font-size: 13px;
-  color: #474d57;
 }
 
 .fallback-arrow {

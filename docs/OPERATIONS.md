@@ -10,15 +10,15 @@
 
 镜像以 `uvicorn --workers N` 启动多个进程共享同一端口，worker 退出由 Uvicorn 自动拉起。N 默认为容器可用 CPU 核数，最多 8；在 Compose gateway 的 environment 填 `WORKERS` 可改。Kubernetes 等按副本扩容的环境建议 `WORKERS: 1`，多开副本。
 
-- 计费模式由 `BILLING_MODE` 决定。默认 `fast`：花费先进 Redis 队列 `five:billing:queue`，每个 worker 每 0.5 秒取最多 500 笔整批写库，待入库金额记在 `five:billing:pending:*`，准入时计入余额；同一时刻并发的请求可能一起越过余额。`strict`：在 MySQL 行锁事务里足额预占，多个 worker、多个容器之间不会超额。两种模式都不会多扣。
-- `fast` 模式下 worker 正在写的批次放在自己的 `five:billing:processing:<id>`，写库失败退回队列；worker 崩溃后由其他 worker 按心跳判断并退回，已入库的按请求 ID 跳过。正常停机会先把队列写完。Redis 必须开启持久化，否则 Redis 丢数据会丢掉还没入库的花费。
-- 每个 worker 在 Redis 写 `five:process:<id>` 心跳（默认 60 秒过期，`PROCESS_STALE_SECONDS`）。worker 崩溃后，其他 worker 接管它留下的预占：未发往上游的释放额度；已发往上游的标为未知结果并继续占用，等待核对，迟到的用量仍按实际金额结算。Redis 不可用时不接管。
+- 花费先进 Redis 队列 `five:billing:queue`，每个 worker 每 0.5 秒取最多 500 笔整批写库，待入库金额记在 `five:billing:pending:*`，结果未知请求的占用记在 `five:billing:held:*`，准入时都计入余额；同一时刻并发的请求可能一起越过余额，但不会多扣。读不到这些计数时请求返回 503 `accounting_unavailable`，不调用上游。
+- worker 正在写的批次放在自己的 `five:billing:processing:<id>`，写库失败退回队列；worker 崩溃后由其他 worker 按心跳判断并退回，已入库的按请求 ID 跳过。正常停机会先把队列写完。Redis 必须开启持久化（Compose 已开 AOF，每秒刷盘），否则 Redis 丢数据会丢掉还没入库的花费。
+- 每个 worker 在 Redis 写 `five:process:<id>` 心跳（默认 60 秒过期，`PROCESS_STALE_SECONDS`）。旧版本留下的已发往上游的预占记录由其他 worker 标为未知结果并继续占用。被强杀的 worker 上正在处理的请求不留记录。
 - 结算恢复、额度重置、日志清理、模型巡检和渠道探测用 Redis `SET NX` 按周期认领，同一周期只有一个 worker 执行。
 - 所有 worker 必须使用同一个 SECRET_KEY：不填时入口脚本在容器启动时随机生成一个并传给全部 worker，重启容器后仍需重新登录。
 - 每个 worker 有独立的 MySQL 连接池，默认上限 `200 / WORKERS`（10–50 之间），可用 `MYSQL_POOL_SIZE` 指定。Compose 中的 MySQL 设为 `--max-connections=500`；使用外部 MySQL 时确保 `max_connections` ≥ 容器数 × WORKERS × 连接池上限再加余量。
 - `/metrics` 汇总全部 worker（`PROMETHEUS_MULTIPROC_DIR`，镜像已设置）。
 
-性能见 [压测报告](BENCHMARK.md)：模拟环境下 8 核机器默认模式每分钟约 6 万次，单个租户也一样；`strict` 模式约 2.4 万次，同一租户的扣费要排队，单个租户约 8400 次，不随 worker 数增加。真实 DeepSeek 渠道下网关让首字只慢约 20 毫秒以内。
+性能见 [压测报告](BENCHMARK.md)：模拟环境下 8 核机器每分钟约 6 万次，单个租户也一样。真实 DeepSeek 渠道下网关让首字只慢约 20 毫秒以内。
 
 留意磁盘：MySQL 默认保留 30 天 binlog，高流量下增长很快，压测中数万次请求就写出了 1GB。磁盘写满时 MySQL 和 Redis 都停止写入，请求和结算会卡住。生产环境要监控磁盘，空间紧张时可执行 `PURGE BINARY LOGS BEFORE NOW() - INTERVAL 3 DAY` 清理旧 binlog。
 
@@ -79,7 +79,7 @@ docker compose exec -T mysql sh -c 'MYSQL_PWD="$MYSQL_PASSWORD" mysqldump -u "$M
 cp .env five-api.env
 ```
 
-两份文件分开加密保存。Redis 的视频任务和滚动窗口数据如需保留，应一并保留 Redis 数据目录；丢失 Redis 会丢失这些状态，不影响已提交的 SQL 账单。
+两份文件分开加密保存。Redis 里有待入库花费、结果未知占用、视频任务和滚动窗口数据，备份前先停网关让队列写完，并一并保留 Redis 数据目录；丢失 Redis 会丢失这些状态，不影响已提交的 SQL 账单。
 
 恢复时保持网关停止，将 SQL 导入选定数据库，把对应的 `.env` 放回项目根目录并设为 0600，再运行匹配版本的迁移与启动。涉及不兼容 schema 时，恢复整套对应版本数据和秘密，不能只回退镜像。
 
@@ -89,11 +89,11 @@ cp .env five-api.env
 
 后台保留自动结算与重试，不常驻独立「结算恢复」页签。系统设置仅在存在 failed、uncertain 记录时显示异常入口。
 
-- reserved：请求预占；调用上游前先持久化 dispatched 标记。
-- pending：已保存实际用量，等待事务扣费。失败按有限退避重试。
+- reserved：旧版本的请求预占，升级后不再产生。
+- pending：花费无法入队（缺价、入队失败等）时保存的实际用量，等待事务扣费。失败按有限退避重试。
 - settled：Key、租户、日志、日汇总已一起提交；重复恢复不重复扣费。
 - failed：自动重试耗尽，或定价计算异常，保留占用等待处理。
-- uncertain：上游可能已执行但没有可信结果，保留估算占用。
+- uncertain：上游可能已执行但没有可信结果，保留估算占用（同时计入 Redis `five:billing:held:*`），处理后解除。
 - released：已确认可释放；不改写历史已用金额。
 
 已知实际费用使用 retry；未知结果与上游核对后，可以记录原因释放或按保存的估算计费。对应平台接口 `/api/settlements/{id}/retry`、`/resolve`。上游执行与本地落库之间存在故障窗口，不能承诺上游调用恰好一次。
@@ -106,7 +106,7 @@ cp .env five-api.env
 
 健康检测会调用实际文本推理端点。降智参考用三类合成任务验证输出，不用于鉴定型号或自动停用渠道。检测产生平台上游费用，不扣客户额度；记录位于 model_probes，默认没有租户访问权限。
 
-客户价 = 模型售价 × 渠道价格倍率；渠道为某模型设了固定价时直接用固定价。请求开始时按候选渠道各自快照报价，按最贵的候选预占，按实际服务渠道结算；导入参考价不覆盖已有配置。
+客户价 = 模型售价 × 渠道价格倍率；渠道为某模型设了固定价时直接用固定价。请求开始时按候选渠道各自快照报价，结果未知时按最贵的候选占用，按实际服务渠道结算；导入参考价不覆盖已有配置。
 
 迁移 24 把模型售价的倍率乘进单价后删除倍率列，客户价不变；删除渠道上游成本表、成本倍率、分时规则和日志、日汇总的 upstream_cost。所有渠道倍率为 1、所有 Key 不绑定渠道，行为与升级前一致。降级只恢复列结构，渠道倍率、固定价和 Key 渠道绑定会丢失，上游成本不可恢复。
 

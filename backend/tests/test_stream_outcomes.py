@@ -85,8 +85,7 @@ async def test_failed_streams_are_logged_and_do_not_reset_channel_failures(clien
     assert (await UsageDaily.get()).error_count == 1
     assert http.send.await_count == 1
     assert not any(name.startswith("five:sticky:") for name in mock_redis.data)
-    settlement = await Settlement.get()
-    assert settlement.state == "settled" and settlement.occupied == 0
+    assert not await Settlement.exists()
     await key.refresh_from_db()
     assert key.quota_used == log.cost
     if case in {"responses_failed", "chat_partial_error", "anthropic_partial_error"}:

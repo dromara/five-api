@@ -17,6 +17,9 @@ def protocol_body(path: str, status: int, detail) -> dict:
             body["type"] = "error"
             body["error"] = {"type": detail["error"].get("type", "api_error"),
                              "message": detail["error"].get("message", "Request rejected")}
+            # Not part of Anthropic's schema; clients ignore it, operators can tell refusals apart.
+            if detail["error"].get("code"):
+                body["error"]["code"] = detail["error"]["code"]
         return body
     kind = ("authentication_error" if status == 401 else "permission_error" if status == 403
             else "rate_limit_error" if status == 429 else "invalid_request_error" if status < 500 else "api_error")

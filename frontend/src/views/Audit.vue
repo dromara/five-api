@@ -5,7 +5,37 @@
         <h3>{{ t('nav.audit') }}</h3>
         <p>{{ t('audit.subtitle') }}</p>
       </div>
+      <el-button @click="openViews">{{ t('audit.viewsTitle') }}</el-button>
     </div>
+
+    <el-dialog v-model="viewsOpen" :title="t('audit.viewsTitle')" width="760px">
+      <p class="views-hint">{{ t('audit.viewsHint') }}</p>
+      <el-table v-loading="loadingViews" :data="views" size="small" :empty-text="t('audit.viewsEmpty')">
+        <el-table-column :label="t('audit.viewsTime')" width="160">
+          <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+        </el-table-column>
+        <el-table-column prop="actor" :label="t('audit.viewsActor')" width="110" />
+        <el-table-column :label="t('audit.viewsAction')" width="100">
+          <template #default="{ row }">
+            {{ row.action === 'audit.report_download' ? t('audit.viewsDownload') : t('audit.viewsRead') }}
+          </template>
+        </el-table-column>
+        <el-table-column prop="api_key_name" :label="t('audit.reportSubject')" min-width="120" />
+        <el-table-column :label="t('audit.reportRange')" min-width="200">
+          <template #default="{ row }">
+            {{ row.from ? `${formatTime(row.from)} ~ ${formatTime(row.to)}` : '-' }}（{{ row.requests }}）
+          </template>
+        </el-table-column>
+      </el-table>
+      <el-pagination
+        v-if="viewsTotal > 50"
+        v-model:current-page="viewsPage"
+        layout="prev, pager, next"
+        :page-size="50"
+        :total="viewsTotal"
+        @current-change="loadViews"
+      />
+    </el-dialog>
 
     <div class="audit-layout">
       <el-card shadow="never" class="people-card" v-loading="loadingPeople">
@@ -497,7 +527,39 @@ async function selectPerson(id: number) {
   }
 }
 
-function downloadReport() {
+const viewsOpen = ref(false)
+const loadingViews = ref(false)
+const views = ref<any[]>([])
+const viewsTotal = ref(0)
+const viewsPage = ref(1)
+
+async function loadViews() {
+  loadingViews.value = true
+  try {
+    const data = await auditApi.views(viewsPage.value)
+    views.value = data.items || []
+    viewsTotal.value = data.total || 0
+  } catch {
+    ElMessage.error(t('audit.loadFailed'))
+  } finally {
+    loadingViews.value = false
+  }
+}
+
+function openViews() {
+  viewsOpen.value = true
+  viewsPage.value = 1
+  loadViews()
+}
+
+async function downloadReport() {
+  if (!selectedId.value) return
+  try {
+    await auditApi.recordDownload(selectedId.value, shownRequests.value.map(row => row.request_id))
+  } catch {
+    ElMessage.error(t('audit.downloadNotRecorded'))
+    return
+  }
   const name = String(selectedPerson.value?.api_key_name || 'key').replace(/[^\w\u4e00-\u9fff-]+/g, '-')
   const blob = new Blob([reportText.value], { type: 'text/plain;charset=utf-8' })
   const url = URL.createObjectURL(blob)
@@ -583,6 +645,12 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+.views-hint {
+  margin: 0 0 12px;
+  color: #667085;
+  font-size: 13px;
+}
+
 .case-head {
   display: flex;
   flex-wrap: wrap;

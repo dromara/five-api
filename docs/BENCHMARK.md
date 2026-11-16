@@ -1,6 +1,8 @@
 # 压测报告
 
-## 默认计费模式（fast），2026-11-14
+## 批量入库计费（fast），2026-11-14
+
+`strict` 模式已移除，现在所有请求都走批量入库计费。移除后准入时每次多读一个「结果未知占用」计数（与原有待入库计数同一次 `MGET`），下面的数据测于移除之前，尚未重测。
 
 0.5.0 之后默认 `BILLING_MODE=fast`，用下面同一台机器、同一个脚本和参数（每轮 4000 次、同时 64 个、模拟上游 5 毫秒），同日先测改动前的 `strict`，再测 `fast`：
 
@@ -38,14 +40,14 @@
 
 - 持续处理能力 Five API 比 new-api 高约 15%，是 LiteLLM 的约 1.8 倍；p50 延迟约为 new-api 的一半。另做了每轮 4000 次的短测试各 3 轮，排名相同。
 - new-api 的日志几乎实时写完；LiteLLM 和 Five API 都在后台批量写，压测结束后分别还要约 1.5 秒和 3–4 秒。
-- 这是 `fast` 模式的成绩。`strict` 模式（约 2.4 万次/分钟）低于另外两家，那是用吞吐换余额一分不超。
+- 这是 `fast` 模式的成绩。已移除的 `strict` 模式约 2.4 万次/分钟。
 - 三家和数据库挤在同一台机器上，结果只用于横向比较，不代表生产容量。
 
 原始数据：[compare-litellm-newapi.json](benchmarks/compare-litellm-newapi.json)。重跑方法：按上面的版本起好三家，new-api 用 [newapi_setup.py](benchmarks/compare/newapi_setup.py) 初始化；Five API 运行 `python -m scripts.benchmark --workers 8 --requests 20000`，另外两家在 `backend` 目录下运行 `PYTHONPATH=. python ../docs/benchmarks/compare/sustained.py <newapi|litellm> <网关地址> <Key 文件> 20000`。
 
-以下为 0.4.0 的 `strict` 模式报告。
+以下为 0.4.0 的 `strict` 模式报告，该模式已移除，仅作历史记录。
 
-## strict 模式（0.4.0）
+## strict 模式（0.4.0，已移除）
 
 版本 0.4.0，2026-10-31。压测分两部分：
 

@@ -131,15 +131,15 @@ async def resolve_candidates(
 
     if not healthy_candidates:
         raise HTTPException(
-            status_code=404,
+            status_code=503,
             detail={
                 "error": {
                     "message": (
-                        f"No channel selected for this API key serves model: {model}" if channel_ids
-                        else f"No channel available for model: {model}"
+                        f"None of the channels selected for this API key serves model {model}" if channel_ids
+                        else f"No channel is available for model {model}; try again later or ask the platform administrator"
                     ),
-                    "type": "invalid_request_error",
-                    "code": "model_not_found",
+                    "type": "api_error",
+                    "code": "no_available_channel",
                 }
             },
         )
@@ -198,25 +198,22 @@ async def resolve_with_fallbacks(
     preferred_protocol: str | None = None,
     sticky_channel_id: int | None = None,
     allowed_models: list[str] | None = None,
-    serve_as: str | None = None,
     channel_ids: list[int] | None = None,
 ) -> list[tuple[Channel, type[BaseProvider]]]:
     """Primary candidates first, then each configured fallback model in order.
 
     Failover walks the list on retryable errors, so the next model is tried
-    only after every channel of the previous one failed. serve_as replaces the
-    requested model from the start, as the budget downgrade does.
+    only after every channel of the previous one failed.
     """
     from app.services.settings_service import gateway_config
 
-    primary = serve_as or model
-    chain = (await gateway_config()).get("model_fallbacks", {}).get(primary, [])
+    chain = (await gateway_config()).get("model_fallbacks", {}).get(model, [])
     chain = [target for target in chain if target != model]
     if allowed_models is not None:
         chain = [target for target in chain if target in allowed_models]
     result: list = []
     first_error: HTTPException | None = None
-    for index, target in enumerate([primary, *chain]):
+    for index, target in enumerate([model, *chain]):
         try:
             found = await resolve_candidates(
                 target, preferred_protocol, sticky_channel_id if index == 0 else None, channel_ids
@@ -224,7 +221,7 @@ async def resolve_with_fallbacks(
         except HTTPException as exc:
             first_error = first_error or exc
             continue
-        if index == 0 and not serve_as:
+        if index == 0:
             result.extend(found)
         else:
             result.extend((channel, _serving(provider_cls, target)) for channel, provider_cls in found)

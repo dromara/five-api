@@ -1,17 +1,15 @@
-"""Money invariants: holds cover charges, and each channel is billed at its own price."""
+"""Money invariants: an unknown outcome's hold covers its charge, and each channel is billed at its own price."""
 import random
 from datetime import datetime, timezone
 from decimal import Decimal
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
 
 from app.models import APIKey, Channel, ModelPrice, Settlement, Tenant
-from app.services import quota, settlements
-from app.services.auth import hash_api_key
+from app.services import quota
 from app.services.billing_quotes import estimate_quotes, quote_cost, selling_quote, snapshot_quotes
-from tests.conftest import auth_header, create_test_tenant
 
 
 def _quote(rng: random.Random) -> dict:
@@ -52,11 +50,11 @@ def test_negative_usage_is_rejected(field):
 async def test_selling_quote_never_silently_prices_at_zero():
     with pytest.raises(HTTPException) as missing:
         await selling_quote("vendor-unknown-model")
-    assert missing.value.status_code == 503
+    assert missing.value.status_code == 400 and missing.value.detail["error"]["code"] == "model_not_priced"
     await ModelPrice.create(model="paused", prompt_price=Decimal(1), completion_price=Decimal(1), is_active=False)
     with pytest.raises(HTTPException) as paused:
         await selling_quote("paused")
-    assert paused.value.status_code == 503
+    assert paused.value.status_code == 400 and "not on sale" in paused.value.detail["error"]["message"]
     await ModelPrice.create(model="free", prompt_price=Decimal(0), completion_price=Decimal(0))
     free = await selling_quote("free")
     assert free["source"] == "global"
@@ -85,41 +83,6 @@ async def test_each_channel_has_its_own_price_and_the_hold_covers_the_dearest():
     assert charge(fixed) == Decimal("5")
     assert charge(dear) == Decimal("25")
     assert estimate_quotes(quotes, 1_000_000, 1_000_000, 0) == Decimal("25")
-
-
-async def test_end_to_end_charge_never_exceeds_the_reservation(client):
-    channel = await Channel.create(name="e2e", provider="openai", base_url="https://e2e.example.com",
-                                   api_key="k", models=["gpt-4o"], price_multiplier=Decimal("1.3"))
-    await ModelPrice.create(model="gpt-4o", prompt_price=Decimal("2.5"), completion_price=Decimal(10),
-                            cached_price=Decimal("1.25"))
-    tenant = await create_test_tenant()
-    raw = "sk-billing-invariant-key"
-    key = await APIKey.create(tenant_id=tenant.id, name="inv", key_hash=hash_api_key(raw),
-                              key_prefix=raw[:8], quota_total=Decimal("100"))
-    body = {"model": "gpt-4o", "max_tokens": 300, "messages": [{"role": "user", "content": "x" * 4000}]}
-    usage = {"prompt_tokens": 1000, "completion_tokens": 300, "total_tokens": 1300,
-             "prompt_tokens_details": {"cached_tokens": 400}}
-    provider = AsyncMock()
-    provider.send_request = AsyncMock(return_value={"id": "1", "object": "chat.completion", "model": "gpt-4o",
-                                                    "choices": [], "usage": usage})
-    provider.apply_model_mapping = lambda model: model
-    holds = []
-    original = settlements.reserve
-
-    async def capture(request_id, api_key, amount, quotes):
-        holds.append(amount)
-        return await original(request_id, api_key, amount, quotes)
-
-    with patch("app.services.routing.resolve_with_fallbacks", return_value=[(channel, lambda _: provider)]), \
-            patch.object(settlements, "reserve", capture):
-        response = await client.post("/v1/chat/completions", json=body, headers=auth_header(raw))
-    assert response.status_code == 200
-    await key.refresh_from_db()
-    await tenant.refresh_from_db()
-    assert len(holds) == 1 and Decimal(0) < key.quota_used <= holds[0]
-    assert tenant.quota_used == key.quota_used
-    record = await Settlement.get()
-    assert record.state == "settled" and record.occupied == 0 and record.cost == key.quota_used
 
 
 class _FixedNow(datetime):

@@ -9,6 +9,8 @@ from typing import Any
 
 from fastapi.responses import JSONResponse
 
+from app.services.redaction import mask_secrets
+
 # utf8mb4 下约 16k 字符仍能放进 TEXT/LONGTEXT，并避免单条日志把表撑得过大。
 MAX_AUDIT_CHARS = 16_000
 
@@ -308,7 +310,8 @@ class AuditBuffer:
     """一次请求的审计缓冲。未开启时不要创建。只保留请求。"""
 
     def __init__(self, request_body: dict | None):
-        self.request_text = request_excerpt(request_body)
+        self.set_request(request_body)
 
     def set_request(self, request_body: dict | None) -> None:
-        self.request_text = request_excerpt(request_body)
+        # Masked here so the raw secret never reaches the billing queue or the database.
+        self.request_text = mask_secrets(request_excerpt(request_body))

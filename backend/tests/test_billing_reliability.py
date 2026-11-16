@@ -1,17 +1,15 @@
 import asyncio
-from contextlib import nullcontext
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
-from uuid import uuid4
 
 import httpx
 import pytest
 from tortoise.queryset import QuerySet
 
 from app.models import APIKey, Channel, ModelPrice, RequestLog, Settlement, Tenant, UsageDaily
-from app.services import settlements
+from app.services import fast_billing, settlements
 from app.services.auth import hash_api_key
-from app.services.quota import begin_request_budget
+from app.services.spend_windows import record_settlement_spend
 from tests.conftest import auth_header
 
 pytestmark = pytest.mark.asyncio
@@ -69,7 +67,7 @@ async def test_selling_price_is_snapshotted_before_the_upstream_call(client):
 
 
 @pytest.mark.parametrize("failure", ["tenant", "log", "daily"])
-async def test_accounting_rolls_back_and_recovers_exactly_once(client, failure):
+async def test_accounting_rolls_back_and_recovers_exactly_once(client, failure, mock_redis):
     tenant, keys, _ = await env()
     original_update = QuerySet.update
 
@@ -80,8 +78,9 @@ async def test_accounting_rolls_back_and_recovers_exactly_once(client, failure):
 
     faults = {
         "tenant": patch.object(QuerySet, "update", new=injected_update),
-        "log": patch.object(RequestLog, "save", new=AsyncMock(side_effect=RuntimeError("log write failure"))),
-        "daily": patch("app.services.logging_service.record_daily_usage", new=AsyncMock(side_effect=RuntimeError("daily failure"))),
+        "log": patch.object(RequestLog, "bulk_create", new=AsyncMock(side_effect=RuntimeError("log write failure"))),
+        "daily": patch("app.services.logging_service.record_daily_totals",
+                       new=AsyncMock(side_effect=RuntimeError("daily failure"))),
     }
     with patch("app.providers.base._shared_http_client", return_value=upstream()), faults[failure]:
         result = await client.post("/v1/chat/completions", json=BODY, headers=auth_header(keys[0][1]))
@@ -89,19 +88,17 @@ async def test_accounting_rolls_back_and_recovers_exactly_once(client, failure):
     assert (await APIKey.get(id=keys[0][0].id)).quota_used == 0
     assert (await Tenant.get(id=tenant.id)).quota_used == 0
     assert await RequestLog.all().count() == await UsageDaily.all().count() == 0
-    record = await Settlement.get()
-    assert record.state == "pending" and record.cost == Decimal("0.000350")
-    assert await settlements.occupied("tenant", tenant.id) == record.cost
-    assert keys[0][1] not in str(record.payload)
-    await Settlement.filter(id=record.id).update(next_retry_at=None)
-    assert await settlements.recover_once() == 1
-    assert await settlements.apply(record.request_id) is False
+    assert await fast_billing.backlog() == 1
+    assert await fast_billing.pending("tenant", tenant.id) == Decimal("0.000350")
+    assert keys[0][1] not in str(mock_redis.lists)
+    assert await fast_billing.flush_once() == 1
+    assert await fast_billing.flush_once() == 0
     assert (await Tenant.get(id=tenant.id)).quota_used == Decimal("0.000350")
     assert (await APIKey.get(id=keys[0][0].id)).quota_used == Decimal("0.000350")
     assert await RequestLog.all().count() == 1
     daily = await UsageDaily.get()
     assert daily.request_count == 1 and daily.cost == Decimal("0.000350")
-    assert await settlements.occupied("tenant", tenant.id) == 0
+    assert await fast_billing.pending("tenant", tenant.id) == 0
 
 
 async def test_identical_client_ids_are_independent_financial_requests(client):
@@ -115,29 +112,8 @@ async def test_identical_client_ids_are_independent_financial_requests(client):
     assert all(result.status_code == 200 for result in responses)
     internal_ids = {result.headers["x-request-id"] for result in responses}
     assert len(internal_ids) == 2 and "same-client-id" not in internal_ids
-    assert await Settlement.filter(state="settled").count() == 2
     assert await RequestLog.filter(client_request_id="same-client-id").count() == 2
     assert (await Tenant.get(id=tenant.id)).quota_used == Decimal("0.000700")
-
-
-async def test_shared_budget_requires_the_full_estimate_before_dispatch(client):
-    _, keys, _ = await env(quota="0.000050")
-    entered, finish = asyncio.Event(), asyncio.Event()
-
-    async def send(*_args, **_kwargs):
-        entered.set()
-        await finish.wait()
-        return response(prompt=1, output=10)
-
-    http = upstream(send)
-    with patch("app.providers.base._shared_http_client", return_value=http):
-        first = asyncio.create_task(client.post("/v1/chat/completions", json=BODY, headers=auth_header(keys[0][1])))
-        await asyncio.wait_for(entered.wait(), timeout=3)
-        denied = await client.post("/v1/chat/completions", json=BODY, headers=auth_header(keys[1][1]))
-        finish.set()
-        assert (await first).status_code == 200
-    assert denied.status_code == 429 and denied.json()["error"]["code"] == "tenant_quota_exceeded"
-    assert http.post.await_count == 1
 
 
 async def test_unpriced_model_does_not_reach_upstream(client):
@@ -146,7 +122,7 @@ async def test_unpriced_model_does_not_reach_upstream(client):
     http = upstream()
     with patch("app.providers.base._shared_http_client", return_value=http):
         result = await client.post("/v1/chat/completions", json=BODY, headers=auth_header(keys[0][1]))
-    assert result.status_code == 503 and result.json()["error"]["code"] == "pricing_unavailable"
+    assert result.status_code == 400 and result.json()["error"]["code"] == "model_not_priced"
     http.post.assert_not_awaited()
     assert await Settlement.all().count() == 0
 
@@ -217,10 +193,10 @@ async def test_window_recovery_does_not_duplicate_spend(client, mock_redis):
     with patch("app.providers.base._shared_http_client", return_value=upstream()):
         result = await client.post("/v1/chat/completions", json=BODY, headers=auth_header(keys[0][1]))
     assert result.status_code == 200
-    record = await Settlement.get()
+    log = await RequestLog.get()
     before = {key: value for key, value in mock_redis.data.items() if key.startswith("five:spend:")}
-    await Settlement.filter(id=record.id).update(windows_recorded=False)
-    await settlements.recover_once()
+    assert before
+    await record_settlement_spend(log.request_id, log.api_key_id, log.tenant_id, log.cost, log.created_at)
     after = {key: value for key, value in mock_redis.data.items() if key.startswith("five:spend:")}
     assert before == after
 

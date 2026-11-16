@@ -8,6 +8,7 @@
         <el-tag :type="row.status_code === 200 ? 'success' : 'danger'" size="small" round>{{ row.status_code }}</el-tag>
         <el-tag v-if="sample" size="small">{{ t('audit.reportSample') }}</el-tag>
         <el-tag v-if="row.keyword_hit" size="small" type="warning">{{ t('audit.reportKeyword') }}</el-tag>
+        <el-tag v-if="row.findings?.length" size="small" type="danger">{{ t('audit.secretTag', { count: row.findings.length }) }}</el-tag>
         <el-tag :type="tagType" size="small">{{ tagText }}</el-tag>
       </span>
       <span class="row-preview">{{ preview }}</span>
@@ -15,6 +16,11 @@
     </button>
     <div v-if="open" class="row-body">
       <p class="verdict-line">{{ line }}</p>
+      <ul v-if="row.findings?.length" class="findings">
+        <li v-for="(finding, i) in row.findings" :key="i">
+          {{ t('audit.secretFinding', { type: finding.type, fingerprint: finding.fingerprint, path: finding.path }) }}
+        </li>
+      </ul>
       <pre class="excerpt">{{ text }}</pre>
     </div>
   </section>
@@ -26,7 +32,12 @@ import { useI18n } from '@/i18n'
 
 /** One request in the audit lists: a single line by default, the full excerpt only when opened. */
 defineProps<{
-  row: { model_requested: string, status_code: number, keyword_hit?: boolean }
+  row: {
+    model_requested: string
+    status_code: number
+    keyword_hit?: boolean
+    findings?: { type: string, fingerprint: string, path: string }[]
+  }
   index: number
   time: string
   tagText: string
@@ -43,6 +54,13 @@ const { t } = useI18n()
 </script>
 
 <style scoped>
+.findings {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  color: #b42318;
+  font-size: 12px;
+}
+
 .audit-row {
   border-top: 1px solid #ededed;
 }

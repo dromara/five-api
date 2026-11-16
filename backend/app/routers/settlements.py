@@ -1,17 +1,18 @@
+import logging
 from datetime import datetime
-from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import Field
 from tortoise.transactions import in_transaction
 
-from app.models import APIKey, ManagementEvent, Settlement, Tenant, User
+from app.models import APIKey, Settlement, Tenant, User
 from app.schemas.user import StrictModel
 from app.services.auth import require_platform_admin
 from app.services.management_events import record_event
-from app.services import settlements
+from app.services import fast_billing, settlements
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/settlements", tags=["accounting recovery"])
 
 
@@ -86,4 +87,9 @@ async def resolve(record_id: int, body: Resolution, actor: User = Depends(requir
             )
         await record_event(actor, "settlement.resolve", record.id, record.tenant_id,
                            {"action": body.action, "reason": body.reason, "occupied": str(record.occupied)})
+    if record.state == "uncertain":
+        try:
+            await fast_billing.unhold(record.api_key_id, record.tenant_id, record.occupied)
+        except Exception:
+            logger.exception("Spend hold release unavailable settlement=%s", record.id)
     return {"message": "Resolution recorded"}

@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from app.models import User, RequestLog, RequestLogAudit
-from app.services.auth import require_platform_admin
+from app.services.auth import require_audit_reader
+from app.services.management_events import record_view
+from app.services.redaction import secret_findings
 from app.services.content_filter import keyword_was_hit
 
 router = APIRouter(prefix="/api/logs", tags=["logs"])
@@ -51,6 +53,7 @@ class LogResponse(BaseModel):
 class LogAuditResponse(BaseModel):
     request_id: str
     audit_request: str
+    findings: list[dict] = []
 
 
 class LogListResponse(BaseModel):
@@ -108,7 +111,7 @@ async def list_logs(
     error_origin: str | None = None,
     start_date: datetime | None = None,
     end_date: datetime | None = None,
-    _: User = Depends(require_platform_admin),
+    _: User = Depends(require_audit_reader),
 ):
     qs = RequestLog.all()
     if client_request_id:
@@ -149,7 +152,7 @@ async def list_logs(
 
 
 @router.get("/{request_id}", response_model=LogResponse)
-async def get_log(request_id: str, _: User = Depends(require_platform_admin)):
+async def get_log(request_id: str, _: User = Depends(require_audit_reader)):
     r = await RequestLog.get_or_none(request_id=request_id)
     if r is None:
         raise HTTPException(status_code=404, detail="Log not found")
@@ -157,7 +160,7 @@ async def get_log(request_id: str, _: User = Depends(require_platform_admin)):
 
 
 @router.get("/{request_id}/audit", response_model=LogAuditResponse)
-async def get_log_audit(request_id: str, _: User = Depends(require_platform_admin)):
+async def get_log_audit(request_id: str, actor: User = Depends(require_audit_reader)):
     """请求正文单独取。打开日志详情不读这段，避免每次点开都拉一大片内容。"""
     r = await RequestLog.get_or_none(request_id=request_id)
     if r is None or not r.has_audit:
@@ -165,4 +168,6 @@ async def get_log_audit(request_id: str, _: User = Depends(require_platform_admi
     audit = await RequestLogAudit.get_or_none(request_log_id=r.id)
     if audit is None or not audit.audit_request:
         raise HTTPException(status_code=404, detail="Audit not found")
-    return LogAuditResponse(request_id=r.request_id, audit_request=audit.audit_request)
+    await record_view(actor, "audit.view", r.api_key_id, r.tenant_id, [r])
+    return LogAuditResponse(request_id=r.request_id, audit_request=audit.audit_request,
+                            findings=secret_findings(audit.audit_request))

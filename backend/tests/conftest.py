@@ -6,8 +6,6 @@ from contextlib import ExitStack
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest-only-0123456789")
 os.environ.setdefault("ENCRYPTION_KEY", "test-upstream-encryption-only-0123456789abcd")
-# Gateway subprocesses started by integration tests inherit this.
-os.environ.setdefault("BILLING_MODE", "strict")
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -237,12 +235,32 @@ class FakePipeline:
 
 
 @pytest.fixture(autouse=True)
-def billing_mode(request):
-    """Most tests assert synchronous settlement; tests marked fast_billing exercise the queued path."""
-    from app.config import settings
-    mode = "fast" if request.node.get_closest_marker("fast_billing") else "strict"
-    with patch.object(settings, "BILLING_MODE", mode):
-        yield mode
+def flush_charges(request):
+    """Write each queued charge as soon as it is queued, so tests can assert the result directly.
+
+    Tests marked queued_billing keep charges in the queue and flush them explicitly.
+    A failed flush leaves the batch queued, as the background loop would.
+    """
+    if request.node.get_closest_marker("queued_billing"):
+        yield
+        return
+    import asyncio
+    from app.services import fast_billing, proxy
+    queue = proxy._queue_charge
+    one_flusher = asyncio.Lock()
+
+    async def queue_and_flush(*args, **kwargs):
+        queued = await queue(*args, **kwargs)
+        if queued:
+            async with one_flusher:
+                try:
+                    await fast_billing.flush_once()
+                except Exception:
+                    pass
+        return queued
+
+    with patch.object(proxy, "_queue_charge", queue_and_flush):
+        yield
 
 
 @pytest.fixture(autouse=True)

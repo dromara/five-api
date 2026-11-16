@@ -1,6 +1,7 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from json import JSONDecodeError
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import ValidationError
@@ -13,10 +14,13 @@ from app.schemas.api_key import (
 )
 from app.services.auth import PLATFORM_ADMIN, hash_api_key, require_account
 from app.services.billing_quotes import channel_override, public_selling_prices
+from app.services.budget_usage import used_up
 from app.services.channel_health import get_health_status
 from app.services.management_events import record_event
+from app.services.pre_checks import get_effective_allowed_models
 from app.services.quota import occupied_quota
 from app.services.rate_limit import RPM_CHECK_SCRIPT
+from app.services import tenant_bill
 from app.services.spend_windows import normalize_limits, window_spend
 from app.utils.key_generator import generate_api_key
 
@@ -38,6 +42,8 @@ async def find_key(key_id: int, actor: User) -> APIKey:
 async def _to_response(key: APIKey, actor: User) -> APIKeyResponse:
     occupied = await occupied_quota("key", key.id)
     remaining = -1 if key.quota_total == -1 else max(Decimal("0"), key.quota_total - key.quota_used - occupied)
+    limits = normalize_limits(key.window_limits)
+    spend = await window_spend("key", key.id) if limits else {}
     tenant = await Tenant.get_or_none(id=key.tenant_id)
     data = dict(
         id=key.id, name=key.name, key_prefix=key.key_prefix,
@@ -49,14 +55,14 @@ async def _to_response(key: APIKey, actor: User) -> APIKeyResponse:
         tenant_is_system=tenant.is_system if tenant else False,
         is_enabled=key.is_enabled, is_revoked=key.is_revoked, expires_at=key.expires_at,
         created_at=key.created_at, updated_at=key.updated_at,
+        exhausted=used_up(key.quota_total, key.quota_used, occupied, limits, spend),
     )
     if actor.role == PLATFORM_ADMIN:
         group = await ModelGroup.get_or_none(id=key.model_group_id) if key.model_group_id else None
         data.update(model_group_id=key.model_group_id, model_group_name=group.name if group else None,
                     audit_policy=key.audit_policy, quota_reset_day=key.quota_reset_day,
                     quota_last_reset_at=key.quota_last_reset_at,
-                    window_limits=normalize_limits(key.window_limits),
-                    window_spend=await window_spend("key", key.id))
+                    window_limits=limits, window_spend=spend or await window_spend("key", key.id))
     return APIKeyResponse(**data)
 
 
@@ -137,9 +143,7 @@ async def tenant_summary(actor: User = Depends(require_account)):
     return await tenant_response(tenant)
 
 
-@router.get("/keys/channels")
-async def key_channels(tenant_id: int | None = None, actor: User = Depends(require_account)):
-    """Channels a key may be bound to, with customer prices. Upstream URLs and secrets stay hidden."""
+async def _price_tenant(actor: User, tenant_id: int | None) -> Tenant:
     if actor.role == PLATFORM_ADMIN:
         tenant = await Tenant.get_or_none(id=tenant_id) if tenant_id else Tenant(allowed_models=[])
     else:
@@ -148,12 +152,52 @@ async def key_channels(tenant_id: int | None = None, actor: User = Depends(requi
         tenant = await Tenant.get_or_none(id=actor.tenant_id)
     if tenant is None:
         raise HTTPException(404, "Tenant not found")
-    channels = await selectable_channels(tenant)
+    return tenant
+
+
+def _routes(channels: list[tuple[Channel, list[str]]]) -> dict[str, list[tuple]]:
     routes: dict[str, list[tuple]] = {}
     for channel, models in channels:
         for model in models:
             routes.setdefault(model, []).append((channel, (channel.model_mapping or {}).get(model, model)))
+    return routes
+
+
+@router.get("/keys/models")
+async def key_models(key_id: int | None = None, tenant_id: int | None = None,
+                     actor: User = Depends(require_account)):
+    """Models callable now, at the customer price of the channels that would serve them.
+
+    Scoped by the tenant model range and, with key_id, by that key's model whitelist and channels.
+    Prices are USD per 1M tokens, and per request for `request`; with several channels the
+    highest is shown and each call is billed at the channel that served it.
+    """
+    tenant = await _price_tenant(actor, tenant_id)
+    channels = await selectable_channels(tenant)
+    allowed = None
+    if key_id is not None:
+        key = await scoped_keys(actor).filter(id=key_id, is_revoked=False).first()
+        if key is None or (tenant.id is not None and key.tenant_id != tenant.id):
+            raise HTTPException(404, "Key not found")
+        allowed = await get_effective_allowed_models(key)
+        if key.channel_ids:
+            channels = [(channel, models) for channel, models in channels if channel.id in key.channel_ids]
+    routes = _routes(channels)
+    if allowed is not None:
+        routes = {model: pairs for model, pairs in routes.items() if model in allowed}
     prices = await public_selling_prices(routes)
+    return [
+        {"model": model, **{field: value for field, value in entry.items() if field != "channels"}}
+        for model, entry in sorted(prices.items())
+    ]
+
+
+@router.get("/keys/channels")
+async def key_channels(tenant_id: int | None = None, actor: User = Depends(require_account)):
+    """Channels a key may be bound to, with customer prices. Upstream URLs and secrets stay hidden."""
+    tenant = await _price_tenant(actor, tenant_id)
+    channels = await selectable_channels(tenant)
+    prices = await public_selling_prices(_routes(channels))
     health = await get_health_status([channel.id for channel, _ in channels])
 
     def model_entry(channel: Channel, model: str) -> dict:
@@ -176,6 +220,40 @@ async def key_channels(tenant_id: int | None = None, actor: User = Depends(requi
         }
         for channel, models in channels
     ]
+
+
+async def _bill(actor: User, tenant_id: int | None, start: date | None, end: date | None) -> dict:
+    if actor.role == PLATFORM_ADMIN:
+        if tenant_id is None:
+            raise HTTPException(400, "tenant_id is required")
+        tenant = await Tenant.get_or_none(id=tenant_id)
+    else:
+        tenant = await Tenant.get_or_none(id=actor.tenant_id) if tenant_id in (None, actor.tenant_id) else None
+    if tenant is None:
+        raise HTTPException(404, "Tenant not found")
+    today = datetime.now(timezone.utc).date()
+    end = end or today
+    start = start or end.replace(day=1)
+    if start > end or (end - start).days >= tenant_bill.MAX_DAYS:
+        raise HTTPException(422, f"Choose a range of at most {tenant_bill.MAX_DAYS} days")
+    return await tenant_bill.build(tenant, start, end)
+
+
+@router.get("/keys/bill")
+async def key_bill(tenant_id: int | None = None, start: date | None = None, end: date | None = None,
+                   actor: User = Depends(require_account)):
+    """Requests and spend per key for a UTC date range, plus spend still queued in Redis now."""
+    return await _bill(actor, tenant_id, start, end)
+
+
+@router.get("/keys/bill.csv")
+async def key_bill_csv(tenant_id: int | None = None, start: date | None = None, end: date | None = None,
+                       lang: Literal["zh", "en"] = "zh", actor: User = Depends(require_account)):
+    bill = await _bill(actor, tenant_id, start, end)
+    return Response(tenant_bill.to_csv(bill, lang), media_type="text/csv; charset=utf-8", headers={
+        "Content-Disposition": f'attachment; filename="five-api-bill-{bill["start"]}-{bill["end"]}.csv"',
+        "Cache-Control": "no-store",
+    })
 
 
 @router.post("/keys", response_model=APIKeyCreateResponse, status_code=201)

@@ -81,6 +81,13 @@ async def require_platform_admin(admin: User = Depends(require_account)) -> User
     return admin
 
 
+async def require_audit_reader(account: User = Depends(require_account)) -> User:
+    """Request bodies, scan results and reports do not exist for tenants, so they get 404."""
+    if account.role != PLATFORM_ADMIN:
+        raise HTTPException(status_code=404, detail="Not found")
+    return account
+
+
 async def check_key_tenant(api_key: APIKey) -> Tenant:
     tenant = await Tenant.get_or_none(id=api_key.tenant_id, is_enabled=True)
     if tenant is None:
@@ -100,7 +107,7 @@ async def check_key_tenant(api_key: APIKey) -> Tenant:
 def cached_tenant(api_key: APIKey) -> Tenant | None:
     """Tenant loaded when this request's key was authenticated.
 
-    Read-only checks may reuse it; spending is enforced again under row lock in settlements.reserve.
+    Admission reuses it, so disabling a tenant applies from the next authenticated request.
     """
     return getattr(api_key, "_request_tenant", None)
 

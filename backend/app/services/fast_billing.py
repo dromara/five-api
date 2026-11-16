@@ -1,8 +1,10 @@
-"""Fast billing: admit requests against cached spend and write charges to MySQL in batches.
+"""Billing: admit requests against cached spend and write charges to MySQL in batches.
 
 Charges wait in a Redis list until a worker flushes them. Until then their amounts sit in
 per-key and per-tenant pending counters, which the admission check adds to quota_used.
 Admission takes no lock, so concurrent requests can together pass the remaining balance.
+Requests whose upstream outcome is unknown hold their estimate in a separate counter until
+an operator resolves the settlement.
 
 A flushing worker moves its batch into its own processing list, so a batch it has taken but
 not committed is still visible and survives the worker exiting.
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 QUEUE = "five:billing:queue"
 PROCESSING_PREFIX = "five:billing:processing:"
 PENDING_PREFIX = "five:billing:pending:"
+HELD_PREFIX = "five:billing:held:"
 MICRO = Decimal(1_000_000)
 FLUSH_INTERVAL = 0.5
 BATCH_SIZE = 500
@@ -44,12 +47,16 @@ return #items
 """
 
 
-def enabled() -> bool:
-    return settings.BILLING_MODE != "strict"
+class AccountingUnavailable(Exception):
+    """Spend cannot be read or queued, so the request must not reach an upstream."""
 
 
 def pending_key(scope: str, owner_id: int) -> str:
     return f"{PENDING_PREFIX}{scope}:{owner_id}"
+
+
+def held_key(scope: str, owner_id: int) -> str:
+    return f"{HELD_PREFIX}{scope}:{owner_id}"
 
 
 def processing_key(owner: str = cluster.OWNER_ID) -> str:
@@ -65,6 +72,14 @@ async def pending(scope: str, owner_id: int) -> Decimal:
     return Decimal(int(await r.get(pending_key(scope, owner_id)) or 0)) / MICRO
 
 
+async def pending_many(scope: str, owner_ids: list[int]) -> dict[int, Decimal]:
+    if not owner_ids:
+        return {}
+    r = await dependencies.get_redis()
+    values = await r.mget([pending_key(scope, owner_id) for owner_id in owner_ids])
+    return {owner_id: Decimal(int(value or 0)) / MICRO for owner_id, value in zip(owner_ids, values)}
+
+
 async def backlog() -> int:
     """Charges queued or taken by a worker but not yet committed."""
     r = await dependencies.get_redis()
@@ -75,16 +90,64 @@ async def backlog() -> int:
 
 
 async def over_budget(api_key: APIKey, tenant: Tenant) -> str | None:
-    """The first scope whose flushed plus pending spend has reached its quota."""
-    owners = [(scope, owner) for scope, owner in (("tenant", tenant), ("key", api_key)) if owner.quota_total != -1]
-    if not owners:
-        return None
-    r = await dependencies.get_redis()
-    values = await r.mget([pending_key(scope, owner.id) for scope, owner in owners])
-    for (scope, owner), value in zip(owners, values):
-        if owner.quota_used + Decimal(int(value or 0)) / MICRO >= owner.quota_total:
+    """The first scope whose flushed, pending and held spend has reached its quota.
+
+    Redis is read even when both quotas are unlimited: a charge this gateway cannot queue
+    must be refused before the upstream call, not discovered after it.
+    """
+    owners = (("tenant", tenant), ("key", api_key))
+    keys = [name for scope, owner in owners for name in (pending_key(scope, owner.id), held_key(scope, owner.id))]
+    try:
+        r = await dependencies.get_redis()
+        values = await r.mget(keys)
+    except Exception as exc:
+        logger.error("Spend counters unavailable: %s", type(exc).__name__)
+        raise AccountingUnavailable from exc
+    for index, (scope, owner) in enumerate(owners):
+        if owner.quota_total == -1:
+            continue
+        pending, held = (int(value or 0) for value in values[2 * index:2 * index + 2])
+        # An unhold racing a rebuild can dip below zero until the next rebuild; never count it as credit.
+        if owner.quota_used + Decimal(pending + max(held, 0)) / MICRO >= owner.quota_total:
             return scope
     return None
+
+
+async def hold(api_key_id: int, tenant_id: int, amount: Decimal) -> None:
+    """Keep an unknown outcome's estimate counted until its settlement is resolved."""
+    micro = _micro(amount)
+    if micro <= 0:
+        return
+    r = await dependencies.get_redis()
+    pipe = r.pipeline(transaction=False)
+    pipe.incrby(held_key("key", api_key_id), micro)
+    pipe.incrby(held_key("tenant", tenant_id), micro)
+    await pipe.execute()
+
+
+async def unhold(api_key_id: int, tenant_id: int, amount: Decimal) -> None:
+    micro = _micro(amount)
+    if micro <= 0:
+        return
+    r = await dependencies.get_redis()
+    pipe = r.pipeline(transaction=False)
+    pipe.decrby(held_key("key", api_key_id), micro)
+    pipe.decrby(held_key("tenant", tenant_id), micro)
+    await pipe.execute()
+
+
+async def set_holds(amounts: dict[tuple[str, int], Decimal]) -> None:
+    """Overwrite every held counter with the amount still occupied in settlement records."""
+    r = await dependencies.get_redis()
+    wanted = {held_key(scope, owner_id): _micro(amount) for (scope, owner_id), amount in amounts.items()
+              if _micro(amount) > 0}
+    stale = [key async for key in r.scan_iter(match=HELD_PREFIX + "*") if key not in wanted]
+    pipe = r.pipeline(transaction=False)
+    for key in stale:
+        pipe.delete(key)
+    for key, micro in wanted.items():
+        pipe.set(key, micro)
+    await pipe.execute()
 
 
 async def enqueue(payload: dict, cost: Decimal, api_key_id: int, tenant_id: int) -> None:
@@ -99,6 +162,7 @@ async def enqueue(payload: dict, cost: Decimal, api_key_id: int, tenant_id: int)
 
 
 async def flush_once(limit: int = BATCH_SIZE) -> int:
+    """Write one batch. Only one call per process may run at a time: they share one processing list."""
     from app.services.logging_service import observe_request_logs, save_request_logs
     from app.services.spend_windows import record_settlement_spends
 
@@ -128,7 +192,7 @@ async def flush_once(limit: int = BATCH_SIZE) -> int:
                     charged[scope][owner_id] += cost
         async with in_transaction():
             logs = await save_request_logs([payload for payload, _ in fresh])
-            # Same lock order as strict settlement: tenants, then keys, each by id.
+            # Same lock order as settlements: tenants, then keys, each by id.
             for model, scope in ((Tenant, "tenant"), (APIKey, "key")):
                 for owner_id, amount in sorted(charged[scope].items()):
                     if amount:

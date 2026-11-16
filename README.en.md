@@ -23,7 +23,7 @@ Five API connects OpenAI, Claude, Gemini, DeepSeek, Qwen and other upstreams. Th
 
 | Use case | Tenants are | Mainly used |
 | --- | --- | --- |
-| Reselling | Your customers | No unpriced requests, per-channel prices, per-request reconciliation; `strict` mode when a balance must never be exceeded |
+| Reselling | Your customers | No unpriced requests, per-channel prices, per-request reconciliation; requests are refused when accounting is unavailable |
 | Inside a company | Departments, teams or projects | Department budgets and chargeback, rate limits, request audit and leak investigation, degradation checks |
 
 It is not a public relay: there is no self sign-up or online top-up, and accounts are opened by the platform. Nor does it aim to support the most providers; getting the money right comes first.
@@ -32,31 +32,32 @@ It is not a public relay: there is no self sign-up or online top-up, and account
 
 ## Why the money does not leak
 
-Whether you bill customers or charge back departments, the costly failures are budgets overspent, calls never billed and calls billed twice. `BILLING_MODE` sets how strictly the balance is held:
+Whether you bill customers or charge back departments, the costly failures are budgets overspent, calls never billed and calls billed twice.
 
-- **`fast` (default), like LiteLLM.** A request is admitted when spend already written plus spend still queued in Redis is below the balance, with no lock and no reservation. Charges go to a Redis queue and each worker writes them to MySQL in batches every 0.5 seconds. Throughput is about 2.5 times `strict`, but requests running at the same moment can jointly spend past a balance; the excess is still charged.
-- **`strict`: reserve in full before calling the upstream.** The cost of the input plus the maximum output is checked against the key and tenant balance, together with every in-flight request, inside a MySQL row-locked transaction. Concurrent requests from several workers and keys cannot jointly spend past a balance. If accounting is unavailable the request is refused, never let through to be billed later.
+- **Admit first, write in batches, like LiteLLM.** A request is admitted when spend already written, spend still queued in Redis and the amount held by requests with an unknown outcome are below the key and tenant budgets, with no lock and no reservation. Charges go to a Redis queue and each worker writes them to MySQL in batches every 0.5 seconds. Requests running at the same moment can jointly spend past a balance; the excess is still charged.
+- **No accounting, no request.** If the queued spend cannot be read from Redis, the request gets 503 `accounting_unavailable` and the upstream is never called.
 - **No price, no request.** A model without a selling price is rejected instead of billed at zero. Only an explicit zero price makes it free.
 - **The price is fixed before dispatch**, so changing prices mid-request does not affect it.
-- **Charges and logs commit together.** Key debit, tenant debit, request log and daily usage commit in one transaction. Failed accounting is recovered exactly once, and a batch that fails or belongs to an exited worker is requeued and deduplicated by request ID; in `strict` mode requests with an unknown upstream outcome keep their reservation until reviewed.
+- **Charges and logs commit together.** Key debit, tenant debit, request log and daily usage commit in one transaction. A batch that fails or belongs to an exited worker is requeued and deduplicated by request ID, so it is charged exactly once. Requests with an unknown upstream outcome keep holding their estimate until reviewed.
 - **Disconnected streams are billed** for what was forwarded. Missing upstream usage is estimated from the content, and the log records the usage source.
 
-Usage above the estimate is still charged in full, never under-billed, so a balance can go slightly negative by at most one request, for example when a request sets no `max_tokens` and the reply exceeds the 4096-token default. Have clients set `max_tokens` for a hard cap.
+Spend past a balance under concurrency is still charged in full, never under-billed, so a balance can go slightly negative; new requests are refused once it is used up.
 
 <details>
 <summary><b>Verify it yourself</b>: each guarantee has automated tests that CI runs on every push</summary>
 
 | Guarantee | Tests |
 | --- | --- |
-| `strict`: within the estimate, the reservation covers every charge; workers sharing a budget never oversell it | `test_end_to_end_charge_never_exceeds_the_reservation`, `test_two_workers_never_overspend_a_shared_tenant_budget` |
-| `fast`: queued spend counts against the balance; failed or orphaned batches are charged exactly once | `tests/test_fast_billing.py` |
+| Queued spend counts against the balance; failed or orphaned batches are charged exactly once | `tests/test_fast_billing.py` |
+| Workers sharing a budget charge every admitted request exactly once | `test_two_workers_charge_every_admitted_request_exactly_once` |
+| Unavailable accounting refuses the request before the upstream call | `test_redis_down_refuses_before_the_upstream_call` |
 | Unpriced models are refused, never billed at zero | `test_unpriced_model_does_not_reach_upstream`, `test_selling_quote_never_silently_prices_at_zero` |
 | Prices are fixed before dispatch | `test_selling_price_is_snapshotted_before_the_upstream_call` |
-| Failed accounting recovers exactly once; unknown outcomes stay reserved | `test_accounting_rolls_back_and_recovers_exactly_once`, `test_timeout_keeps_unknown_work_occupied` |
+| Failed accounting recovers exactly once; unknown outcomes keep their hold | `test_accounting_rolls_back_and_recovers_exactly_once`, `test_unknown_outcome_holds_its_estimate_until_resolved` |
 | Broken streams are billed and never replayed upstream | `test_real_http_stream_and_client_cancellation_releases_leases`, `test_disconnect_after_first_byte_does_not_replay_upstream` |
 
 ```bash
-cd backend && ../.venv/bin/pytest -q tests/test_billing_invariants.py tests/test_billing_reliability.py
+cd backend && ../.venv/bin/pytest -q tests/test_billing_invariants.py tests/test_billing_reliability.py tests/test_fast_billing.py
 ```
 
 The benchmarks recompute every charge from the logged tokens and the price and reconcile it with the charge, key usage and tenant usage. All 8 simulated rounds pass, and 320 requests through a real DeepSeek channel show 0 mismatches. Raw data and commands are in the [benchmark report](docs/BENCHMARK.md).
@@ -68,7 +69,7 @@ The benchmarks recompute every charge from the logged tokens and the price and r
 | | Five API | [new-api](https://github.com/QuantumNous/new-api) | [LiteLLM](https://github.com/BerriAI/litellm) |
 |---|---|---|---|
 | Focus | Provisioned accounts, billing per customer or department | Public relay with self sign-up and online top-up | Internal enterprise egress, 100+ providers |
-| Reservation | None by default, admitted on written plus queued spend; `strict` reserves input plus output cap in full in a MySQL transaction | Only estimated input reserved; skipped when the balance exceeds 10 USD | Relies on Redis; hard limits need fail-closed enabled separately |
+| Reservation | None, admitted on written plus queued spend; refused when Redis accounting is unreadable | Only estimated input reserved; skipped when the balance exceeds 10 USD | Relies on Redis; hard limits need fail-closed enabled separately |
 | Unpriced model | Request refused | Price error returned | Allowed and billed at 0 |
 | Same-host throughput (defaults, [measured](docs/BENCHMARK.md)) | 47,000–53,000 requests per minute | 43,000–45,000 | 28,000 |
 | Request audit | Saved per key, secret scanning, AI review report | Request content not stored; viewing prompts is [not planned](https://github.com/QuantumNous/new-api/issues/7609) | Prompt logging optional; secret detection is [enterprise](https://docs.litellm.ai/docs/enterprise) |
@@ -89,7 +90,7 @@ Based on public documentation and issues as of October 2026. For new-api's reser
 | Failover | 5xx, timeouts, 429 and revoked upstream keys switch channels; streams switch only before the first byte; circuit breaker; non-idempotent requests such as images and videos are never resubmitted |
 | Audit | Request excerpts saved per key and scanned for private keys and AWS, GitHub and Slack tokens, which are masked before storage; a cheap model can review a key's requests and produce a downloadable report |
 | Model quality | Periodic health checks, plus a daily synthetic suite for GPT/Claude channels covering instruction following, reasoning and tool use |
-| Cost | Daily cache hit and savings insights; automatic Anthropic cache markers; automatic downgrade to a cheaper model near the budget |
+| Cost | Daily cache hit and savings insights; automatic Anthropic cache markers; a used-up budget refuses requests instead of switching to a cheaper model |
 | Security | Upstream keys encrypted at rest with an optional master key kept apart from the JWT key and outside the database; API keys shown once |
 | Console | Vue 3, Chinese and English |
 
@@ -174,7 +175,7 @@ env_key = "FIVE_API_KEY"
 wire_api = "responses"
 ```
 
-**Cursor** calls a custom base URL from Cursor's servers, so the gateway needs a public HTTPS address; it has not been tested end to end. See the [client guide](docs/CLIENTS.md) for troubleshooting.
+**Cursor** calls a custom base URL from Cursor's servers, so the gateway needs a public HTTPS address. Checked again on 2026-11-16: Agent CLI 2026.11.13 talks only to Cursor's own API and cannot stand in for that setting, and this environment has no public HTTPS gateway, so it is still untested. See the [client guide](docs/CLIENTS.md).
 
 ## Deployment and operations
 
@@ -187,7 +188,6 @@ All settings are written directly in `docker-compose.yml`; run `./service.sh dep
 | `SECRET_KEY` | Login token key; without it logins end on every restart |
 | `ENCRYPTION_KEY` | Upstream key encryption; without it a built-in public key is used. Migrate before setting it once channels exist |
 | `WORKERS` | Worker processes, default one per CPU core, up to 8 |
-| `BILLING_MODE` | `fast` (default: admit first, write spend in batches; concurrent requests can exceed a balance) or `strict` (reserve in full; balances are never exceeded) |
 | `ports` | 8080 by default |
 
 For production:
@@ -202,12 +202,11 @@ On one 8-core, 16 GB machine, with every charge reconciled in each run:
 
 | Test | Result |
 |---|---|
-| Simulated upstream capacity, default `fast` mode | About 60,000 requests per minute (4–8 workers), a single tenant included; 35,000–47,000 sustained once background writes are counted |
+| Simulated upstream capacity | About 60,000 requests per minute (4–8 workers), a single tenant included; 35,000–47,000 sustained once background writes are counted |
 | Same-host comparison, background writes included | Five API 47,000–53,000 requests per minute, new-api 43,000–45,000, LiteLLM 28,000; p50 latency about 50, 85 and 115 ms |
-| Simulated upstream capacity, `strict` mode | About 24,000 requests per minute across many tenants; about 8,400 for a single tenant |
 | Real DeepSeek channel, 10–50 concurrent streams | All succeeded; first token only 6–19 ms slower than calling DeepSeek directly |
 
-In `strict` mode a single tenant's requests pass through one row lock, the price of a balance that is never exceeded. Full data is in the [benchmark report](docs/BENCHMARK.md).
+Full data is in the [benchmark report](docs/BENCHMARK.md).
 
 ## Limits
 
@@ -229,7 +228,7 @@ cd backend && ../.venv/bin/pytest -q
 | Directory | Responsibility |
 | --- | --- |
 | `backend/app/routers/` | Management API and OpenAI/Anthropic inference endpoints |
-| `backend/app/services/` | Billing, reservation and settlement, routing, rate limits, audit |
+| `backend/app/services/` | Billing queue and settlement, routing, rate limits, audit |
 | `backend/app/providers/` | Upstream adapters |
 | `backend/tests/` | Fast tests and integration tests against real MySQL and Redis |
 | `backend/scripts/` | Benchmarks, release checks, smoke tests |

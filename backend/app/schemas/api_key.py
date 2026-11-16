@@ -98,6 +98,8 @@ class APIKeyResponse(BaseModel):
     quota_last_reset_at: datetime | None = None
     window_limits: dict[str, float] = Field(default_factory=dict)
     window_spend: dict[str, float] = Field(default_factory=dict)
+    # Budgets new requests are refused on now: "quota" or a rolling window such as "5h".
+    exhausted: list[str] = Field(default_factory=list)
     expires_at: datetime | None
     created_at: datetime
     updated_at: datetime

@@ -72,13 +72,6 @@ async def test_usage_reported_after_takeover_settles_actual_cost():
     assert refreshed.state == "pending" and refreshed.occupied == Decimal("0.4")
 
 
-async def test_undispatched_takeover_blocks_the_upstream_call():
-    await held("slow-start", EXITED, False, settings.PROCESS_STALE_SECONDS + 5)
-    await settlements.recover_orphans()
-    with pytest.raises(RuntimeError, match="before upstream dispatch"):
-        await settlements.mark_dispatched("slow-start")
-
-
 async def test_heartbeat_marks_this_worker_live_until_it_leaves():
     await cluster.beat()
     assert await cluster.live_owners([cluster.OWNER_ID, EXITED]) == {cluster.OWNER_ID}

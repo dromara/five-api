@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import re
 
@@ -32,6 +34,52 @@ _UPSTREAM_ACCOUNT_PATTERNS = [
     (re.compile(r"(?i)\b(limit:?\s*)\d[\d,.]*(,\s*used:?\s*)\d[\d,.]*"), r"\1[REDACTED]\2[REDACTED]"),
     (re.compile(r"(?i)\b(of\s+)\d[\d,]*(\s+(?:input\s+|output\s+)?tokens?\s+per\s+(?:minute|day|hour))"), r"\1[REDACTED]\2"),
 ]
+
+
+_SECRET_MASKS = [(replacement.removeprefix("[REDACTED:").removesuffix("]"), pattern)
+                 for pattern, replacement in _PATTERNS if replacement.startswith("[REDACTED:")]
+
+
+def mask_secrets(value):
+    """Mask scanned secrets in place as [REDACTED:type#fingerprint].
+
+    The fingerprint is the first 8 hex digits of the secret's SHA-256, enough to tell whether
+    two requests carried the same secret without keeping anything that recovers it.
+    """
+    if isinstance(value, dict):
+        return {key: mask_secrets(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [mask_secrets(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    for label, pattern in _SECRET_MASKS:
+        value = pattern.sub(
+            lambda match: f"[REDACTED:{label}#{hashlib.sha256(match.group(0).encode()).hexdigest()[:8]}]", value)
+    return value
+
+
+_MASK = re.compile(r"\[REDACTED:([a-z_]+)#([0-9a-f]{8})\]")
+MAX_FINDINGS = 50
+
+
+def secret_findings(stored: str) -> list[dict]:
+    """Type, JSON path and fingerprint of every mask in a stored body."""
+    try:
+        root = json.loads(stored)
+    except (TypeError, ValueError):
+        root = stored
+    found: list[dict] = []
+    stack = [("$", root)]
+    while stack and len(found) < MAX_FINDINGS:
+        path, value = stack.pop()
+        if isinstance(value, dict):
+            stack.extend((f"{path}.{key}", item) for key, item in reversed(value.items()))
+        elif isinstance(value, list):
+            stack.extend((f"{path}[{index}]", item) for index, item in reversed(list(enumerate(value))))
+        elif isinstance(value, str):
+            found.extend({"type": match.group(1), "fingerprint": match.group(2), "path": path}
+                         for match in _MASK.finditer(value))
+    return found[:MAX_FINDINGS]
 
 
 def redact(value):

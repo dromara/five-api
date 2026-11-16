@@ -96,8 +96,8 @@ async def test_tenant_key_write_allowlist_rejects_sensitive_fields(client, field
 
 @pytest.mark.parametrize("method,path,body", [
     ("GET", "/api/channels", None), ("GET", "/api/model-prices", None),
-    ("GET", "/api/stats/overview", None), ("GET", "/api/logs", None),
-    ("GET", "/api/settings", None), ("GET", "/api/audit/keys", None),
+    ("GET", "/api/stats/overview", None),
+    ("GET", "/api/settings", None),
     ("GET", "/api/security", None), ("GET", "/api/users", None),
     ("GET", "/api/tenants/all", None), ("GET", "/api/model-groups/all", None),
     ("POST", "/api/users", {"username": "evil", "password": "evil-password"}),

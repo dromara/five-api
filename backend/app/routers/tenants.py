@@ -10,6 +10,7 @@ from app.schemas.tenant import (
     TenantCreate, TenantCreated, TenantPasswordReset, TenantQuotaUpdate, TenantResponse, TenantUpdate,
 )
 from app.services.auth import hash_password, require_platform_admin
+from app.services.budget_usage import used_up
 from app.services.management_events import record_event
 from app.services.passwords import resolve_new_password
 from app.services.quota import occupied_quota
@@ -21,6 +22,8 @@ router = APIRouter(prefix="/api/tenants", tags=["tenants"])
 async def tenant_response(tenant: Tenant) -> TenantResponse:
     account = await User.get_or_none(tenant_id=tenant.id)
     occupied = await occupied_quota("tenant", tenant.id)
+    limits = normalize_limits(tenant.window_limits)
+    spend = await window_spend("team", tenant.id)
     return TenantResponse(
         id=tenant.id, name=tenant.name, description=tenant.description,
         username=account.username if account else None, account_id=account.id if account else None,
@@ -28,7 +31,8 @@ async def tenant_response(tenant: Tenant) -> TenantResponse:
         quota_remaining=Decimal("-1") if tenant.quota_total == -1 else max(
             Decimal("0"), tenant.quota_total - tenant.quota_used - occupied),
         quota_reset_day=tenant.quota_reset_day, is_enabled=tenant.is_enabled,
-        window_limits=normalize_limits(tenant.window_limits), window_spend=await window_spend("team", tenant.id),
+        window_limits=limits, window_spend=spend,
+        exhausted=used_up(tenant.quota_total, tenant.quota_used, occupied, limits, spend),
         allowed_models=tenant.allowed_models, max_keys=tenant.max_keys,
         rpm_limit=tenant.rpm_limit, tpm_limit=tenant.tpm_limit, concurrent_limit=tenant.concurrent_limit,
         key_count=await APIKey.filter(tenant_id=tenant.id, is_revoked=False).count(),

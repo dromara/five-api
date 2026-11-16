@@ -1,17 +1,22 @@
-"""Durable reservations and idempotent accounting in the same SQL transaction."""
+"""Durable accounting records for charges that cannot go through the spend queue.
+
+Unpriced usage, charges the queue rejected, internal calls and upstream outcomes nobody can
+know are kept here and settled in one SQL transaction with the request log. Occupied amounts
+are mirrored in the fast_billing held counters, so admission keeps counting them until the
+record settles or an operator resolves it. Recovery rebuilds the counters from these rows.
+"""
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from tortoise.exceptions import IntegrityError
 from tortoise.expressions import F
 from tortoise.functions import Sum
 from tortoise.transactions import in_transaction
 
 from app.config import settings
-from app.models import APIKey, RequestLog, Settlement, Tenant
-from app.services import cluster
+from app.models import APIKey, Settlement, Tenant
+from app.services import cluster, fast_billing
 from app.services.cluster import OWNER_ID
 from app.services.logging_service import save_request_log, observe_request_log
 from app.services.redaction import redact
@@ -25,11 +30,6 @@ LEGACY_PAYLOAD_FIELDS = frozenset({"upstream_cost"})
 _unsaved: dict[str, tuple[dict, Decimal | None, str]] = {}
 
 
-class BudgetDenied(Exception):
-    def __init__(self, scope):
-        self.scope = scope
-
-
 async def occupied(scope: str, owner_id: int) -> Decimal:
     field = "tenant_id" if scope == "tenant" else "api_key_id"
     rows = await Settlement.filter(**{field: owner_id}, state__in=OCCUPIED_STATES).annotate(
@@ -38,26 +38,31 @@ async def occupied(scope: str, owner_id: int) -> Decimal:
     return Decimal(str(rows[0]["amount"] or 0)) if rows else Decimal(0)
 
 
-async def reserve(request_id: str, api_key: APIKey, amount: Decimal, quotes: dict) -> None:
-    # Every path locks tenant -> key -> settlement. Multiple keys share the same tenant lock.
+async def sync_holds() -> None:
+    amounts: dict[tuple[str, int], Decimal] = {}
+    for scope, field in (("key", "api_key_id"), ("tenant", "tenant_id")):
+        rows = await Settlement.filter(state__in=OCCUPIED_STATES).annotate(
+            amount=Sum("occupied"),
+        ).group_by(field).values(field, "amount")
+        for row in rows:
+            amounts[(scope, row[field])] = Decimal(str(row["amount"] or 0))
+    await fast_billing.set_holds(amounts)
+
+
+async def hold_unknown(request_id: str, api_key_id: int, tenant_id: int, estimate: Decimal,
+                       quotes: dict, payload: dict | None) -> None:
+    """The upstream may have charged for this request; keep its estimate occupied for review."""
+    await Settlement.create(
+        request_id=request_id, tenant_id=tenant_id, api_key_id=api_key_id, state="uncertain",
+        occupied=estimate, quotes=quotes, payload=redact(payload) if payload else None,
+        owner_id=OWNER_ID, dispatched=True,
+        last_error="Upstream outcome unknown; manual reconciliation required",
+    )
     try:
-        async with in_transaction():
-            tenant = await Tenant.filter(id=api_key.tenant_id).select_for_update().first()
-            key = await APIKey.filter(id=api_key.id).select_for_update().first()
-            if not tenant or not tenant.is_enabled:
-                raise BudgetDenied("tenant_disabled")
-            if not key or key.is_revoked or not key.is_enabled:
-                raise BudgetDenied("key_disabled")
-            for scope, owner in (("tenant", tenant), ("key", key)):
-                if owner.quota_total != -1:
-                    held = await occupied(scope, owner.id)
-                    if owner.quota_used + held + amount > owner.quota_total or owner.quota_used + held >= owner.quota_total:
-                        raise BudgetDenied(scope)
-            # The unique request_id index rejects a replayed reservation without an extra lookup.
-            await Settlement.create(request_id=request_id, tenant_id=tenant.id, api_key_id=key.id,
-                                    occupied=amount, quotes=quotes, owner_id=OWNER_ID)
-    except IntegrityError:
-        raise BudgetDenied("duplicate_request") from None
+        await fast_billing.hold(api_key_id, tenant_id, estimate)
+    except Exception:
+        # The durable record still shows the amount; only admission stops counting it.
+        logger.exception("Spend hold unavailable request_id=%s", request_id)
 
 
 async def mark_pending(request_id: str, payload: dict, cost: Decimal | None, error: str = "") -> None:
@@ -79,22 +84,6 @@ async def persist_usage(request_id: str, payload: dict, cost: Decimal | None, er
         # The durable reservation remains occupied. Retry saving actual usage in this process.
         _unsaved[request_id] = (redact(payload), cost, error)
         logger.critical("Usage persistence pending request_id=%s", request_id, exc_info=True)
-
-
-async def release(request_id: str) -> None:
-    # Pending/uncertain amounts remain occupied until a successful settlement or explicit operator resolution.
-    await Settlement.filter(request_id=request_id, state="reserved").update(state="released", occupied=0)
-
-
-async def mark_dispatched(request_id: str) -> None:
-    if not await Settlement.filter(request_id=request_id, state="reserved").update(dispatched=True):
-        raise RuntimeError("Reservation unavailable before upstream dispatch")
-
-
-async def abandon(request_id: str) -> None:
-    await Settlement.filter(request_id=request_id, state="reserved").update(
-        state="uncertain", last_error="Upstream result unavailable; reconcile before release",
-    )
 
 
 async def apply(request_id: str, owners: tuple[int, int] | None = None) -> bool:
@@ -164,7 +153,7 @@ async def flush_unsaved() -> None:
 
 
 async def recover_orphans(now: datetime | None = None) -> int:
-    """Take over reservations of workers whose heartbeat has expired.
+    """Take over reservations left by releases that reserved before the upstream call.
 
     Undispatched work never reached the upstream and is released. Dispatched work may have
     been charged upstream, so it stays occupied as uncertain for reconciliation.
@@ -185,9 +174,16 @@ async def recover_orphans(now: datetime | None = None) -> int:
         return 0
     released = await Settlement.filter(state="reserved", dispatched=False, owner_id__in=exited,
                                        created_at__lt=cutoff).update(state="released", occupied=0)
-    uncertain = await Settlement.filter(state="reserved", dispatched=True, owner_id__in=exited,
-                                        created_at__lt=cutoff).update(
-        state="uncertain", last_error="Process exited before usage was persisted")
+    uncertain = 0
+    for record in await Settlement.filter(state="reserved", dispatched=True, owner_id__in=exited,
+                                          created_at__lt=cutoff):
+        if await Settlement.filter(id=record.id, state="reserved").update(
+                state="uncertain", last_error="Process exited before usage was persisted"):
+            uncertain += 1
+            try:
+                await fast_billing.hold(record.api_key_id, record.tenant_id, record.occupied)
+            except Exception:
+                logger.exception("Spend hold unavailable request_id=%s", record.request_id)
     if released or uncertain:
         logger.warning("Took over %d released and %d uncertain reservations from exited workers",
                        released, uncertain)
@@ -228,6 +224,7 @@ async def recovery_loop():
             if await cluster.claim("settlement-recovery", RECOVERY_INTERVAL):
                 await recover_orphans()
                 await recover_once()
+                await sync_holds()
         except Exception:
             logger.exception("Settlement recovery unavailable")
         await asyncio.sleep(RECOVERY_INTERVAL)

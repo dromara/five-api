@@ -1,5 +1,7 @@
 from contextlib import asynccontextmanager
 import asyncio
+import logging
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -37,6 +39,9 @@ async def lifespan(app: FastAPI):
         generate_schemas=False,
         add_exception_handlers=True,
     ):
+        if "BILLING_MODE" in os.environ:
+            logging.getLogger(__name__).warning(
+                "BILLING_MODE is ignored: every request is billed through the spend queue")
         from app.utils.secrets import encrypt_plaintext_channel_keys, load_secret_key
         await load_secret_key()
         await encrypt_plaintext_channel_keys()
@@ -53,11 +58,10 @@ async def lifespan(app: FastAPI):
         ACTIVE_CHANNELS.set(await Channel.filter(is_enabled=True).count())
         ACTIVE_KEYS.set(await APIKey.filter(is_enabled=True).count())
         # Announce this worker before it takes requests. Takeover also waits PROCESS_STALE_SECONDS
-        # after a reservation, so the heartbeat loop can still recover from a Redis outage here.
+        # after a taken batch, so the heartbeat loop can still recover from a Redis outage here.
         try:
             await cluster.beat()
         except Exception:
-            import logging
             logging.getLogger(__name__).exception("Worker heartbeat unavailable at startup")
         tasks = tuple(asyncio.create_task(loop()) for loop in (
             cluster.heartbeat_loop, quota_reset_loop, health_check_loop, log_cleanup_loop,
@@ -79,7 +83,6 @@ async def lifespan(app: FastAPI):
                     await recover_once()
                     await cluster.leave()
             except Exception:
-                import logging
                 logging.getLogger(__name__).exception("Shutdown recovery incomplete; durable records remain for restart")
     from app.dependencies import close_redis
     from app.providers.base import close_http_clients
@@ -138,7 +141,7 @@ def _mount_frontend(app: FastAPI) -> None:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Five API Gateway", version="0.6.2", lifespan=lifespan)
+    app = FastAPI(title="Five API Gateway", version="0.7.0", lifespan=lifespan)
     from app.services.protocol_errors import install_error_handlers
     from app.services.redaction import configure_safe_logging
     install_error_handlers(app)

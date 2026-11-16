@@ -255,32 +255,6 @@ async def test_cross_channel_failover_is_logged(client):
     assert log.failed_over is True
 
 
-async def test_quota_hold_rejects_a_request_larger_than_the_remainder(client):
-    ch, _, _ = await _setup_proxy_env()
-    raw = "sk-hold-small"
-    key = await APIKey.create(tenant_id=(await create_test_tenant()).id,
-        name="hold-small",
-        key_hash=hash_api_key(raw),
-        key_prefix=raw[:8],
-        quota_total=Decimal("0.01"),
-        quota_used=Decimal("0"),
-    )
-    provider = AsyncMock()
-    provider.send_request = AsyncMock(return_value=MOCK_COMPLETION_RESPONSE)
-    provider.apply_model_mapping = lambda m: m
-    provider.close = AsyncMock()
-    with patch("app.services.routing.resolve_with_fallbacks", return_value=[(ch, lambda _: provider)]):
-        resp = await client.post(
-            "/v1/chat/completions",
-            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
-            headers=auth_header(raw),
-        )
-    assert resp.status_code == 429
-    provider.send_request.assert_not_awaited()
-    await key.refresh_from_db()
-    assert key.quota_used == 0
-
-
 async def test_tpm_limit_rejects_before_upstream(client):
     await _setup_proxy_env()
     raw = "sk-tpm-reject"
@@ -752,7 +726,7 @@ async def test_embeddings_rejects_anthropic_only_channel(client):
         json={"model": "embedding-lookalike", "input": "hello"},
         headers=auth_header(raw_key),
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 503
 
 
 async def test_no_channel_for_model(client):
@@ -768,7 +742,7 @@ async def test_no_channel_for_model(client):
         json={"model": "nonexistent-model", "messages": [{"role": "user", "content": "hi"}]},
         headers=auth_header(raw_key),
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 503
 
 
 async def test_inference_audit_records_only_when_enabled(client):

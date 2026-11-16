@@ -10,7 +10,7 @@
 | Codex CLI | 0.164.0 | 通过：`codex exec` 多轮、执行命令和写文件，按上游用量计费 |
 | openai Python SDK | 3.37.0 | 通过：聊天、工具调用、流式、Responses 与认证错误 |
 | anthropic Python SDK | 2.3.0 | 通过：消息、tool_use、文本流与最终用量 |
-| Cursor | — | 未实测，见下文原因 |
+| Cursor | 2026.11.13（Agent CLI） | 尚未通过，见下文。没有发出对话请求，也没有账单 |
 
 每次实测后都在请求日志里核对了状态码、渠道、上游用量和扣费。图片、音频、视频、Beta 扩展和具体厂商需要用实际部署另验。
 
@@ -66,9 +66,9 @@ Codex 在收到 `response.completed` 后立即断开连接，网关会把这种�
 
 ## Cursor
 
-Cursor 设置 → Models → API Keys，打开「OpenAI API Key」填入 `sk-...`，打开「Override OpenAI Base URL」填 `https://your-gateway/v1`，再在模型列表里添加网关上的模型名（如 `deepseek-v4-flash`）。
+按 Cursor 自己的说明（不是本次实测），设置 → Models → API Keys，打开「OpenAI API Key」填入 `sk-...`，打开「Override OpenAI Base URL」填 `https://your-gateway/v1`，再添加网关上的模型名。聊天走 `/v1/chat/completions`，Agent 模式走 `/v1/responses`。这两类请求由 Cursor 的服务器发出，所以网关必须是公网 HTTPS；`localhost`、内网地址和纯 HTTP 都到不了。Tab 补全不走这个地址。
 
-**未实测原因**：Cursor 的自定义地址由 Cursor 的服务器发起请求，而不是从你的电脑发起，所以网关必须有公网可访问的 HTTPS 地址，`localhost`、内网地址都不能用。我们的测试环境没有公网地址，因此未做端到端验证。Cursor 的 Agent、Tab 补全等功能是否会走自定义地址由 Cursor 决定，以 Cursor 官方说明为准。
+**2026-11-16 尚未通过。** 本机 Cursor Agent CLI 为 `2026.11.13-eacade1`。它的 `--endpoint` 默认是 `https://api2.cursor.sh`，走的是 Cursor 自己的 Agent 协议，没有把 OpenAI Base URL 指到 five-api 的开关，不能用来代替 IDE 里的那次对话。开发环境网关是 `http://127.0.0.1:5002`，没有公网 HTTPS。因此没有向 `/v1/chat/completions` 或 `/v1/responses` 发过 Cursor 的请求，Key 账单里也没有对应记录。文档保持「尚未实测」，不能据此认为 Cursor 可用。
 
 ## 功能支持情况
 
@@ -89,6 +89,7 @@ Cursor 设置 → Models → API Keys，打开「OpenAI API Key」填入 `sk-...
 | --- | --- |
 | 401 | Key 填错、已撤销或已过期 |
 | 403 | 模型不在这个 Key 的允许范围，或租户已停用 |
-| 404 `model_not_found` | 没有提供该模型的对应协议渠道：Claude Code 需要 Anthropic 渠道；Key 限定了渠道时只在这些渠道里找 |
-| 429 | 额度用完（`quota_exceeded`）或超过每分钟请求、token、并发限制 |
+| 400 `model_not_priced` | 平台没给这个模型配售价或已停售，消息里写明模型名，找平台管理员配价格 |
+| 429 `quota_exceeded`、`tenant_quota_exceeded`、`window_limit`、`tenant_window_limit` | 额度用完：分别是 Key 总额度、租户总额度、Key 和租户的 5h/1d/7d 滚动限额，不会自动换成便宜模型。其他 429 是每分钟请求、token、并发限制 |
+| 503 `no_available_channel` | 没有提供该模型的对应协议渠道：Claude Code 需要 Anthropic 渠道；Key 限定了渠道时只在这些渠道里找 |
 | 本地网关连不上 | 系统设置了 HTTP 代理时，把网关地址加入 `NO_PROXY` |

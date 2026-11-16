@@ -4,8 +4,8 @@
 services:
   gateway:
     # 发布镜像，支持 amd64/arm64。升级时改成新版本号再 ./service.sh deploy。
-    # 用自己修改过的代码：docker build -t ghcr.io/timmy1688/five-api:0.6.2 . 后再部署。
-    image: ghcr.io/timmy1688/five-api:0.6.2
+    # 用自己修改过的代码：docker build -t ghcr.io/timmy1688/five-api:0.7.0 . 后再部署。
+    image: ghcr.io/timmy1688/five-api:0.7.0
     restart: always
     ports:
       - "8080:8000"
@@ -24,8 +24,6 @@ services:
       # ENCRYPTION_KEY: random_string
       # 默认按 CPU 核数启动 worker（最多 8 个）；内存紧张时调小，Kubernetes 上建议 1 并增加副本。
       # WORKERS: 4
-      # fast：先放行、花费后台批量入库，并发时可能超出余额；strict：调用上游前足额预占，余额不超。
-      # BILLING_MODE: strict
     stop_grace_period: 40s
     depends_on:
       mysql:
@@ -36,6 +34,8 @@ services:
   redis:
     image: redis:7-alpine
     restart: always
+    # 还没写入 MySQL 的花费在 Redis 里，AOF 每秒刷盘，Redis 重启不丢账。
+    command: redis-server --appendonly yes --appendfsync everysec
     # 只给本机开发用，外部机器连不上。网关走容器内网，不经过这个端口。
     ports:
       - "127.0.0.1:6379:6379"

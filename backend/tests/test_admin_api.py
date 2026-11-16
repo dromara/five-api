@@ -613,7 +613,6 @@ async def test_gateway_settings_round_trip(client):
         "routing_strategy": "least_busy",
         "model_fallbacks": {},
         "auto_cache_control": False,
-        "budget_downgrade": {"threshold": 0.8, "rules": {}},
     }
     saved = await client.put("/api/settings", json=body, headers=headers)
     assert saved.status_code == 200

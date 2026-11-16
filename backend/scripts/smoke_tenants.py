@@ -133,6 +133,11 @@ async def run():
             payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
             response = await client.post("/v1/chat/completions", headers=application, json=payload)
             assert response.status_code == 200, "inference"
+            # Charges reach MySQL in the next spend-queue batch, about every 0.5 seconds.
+            for _ in range(100):
+                if await RequestLog.filter(api_key_id=key["id"], status_code=200).exists():
+                    break
+                await asyncio.sleep(0.1)
             tenant = await Tenant.get(id=tenant_ids[0])
             stored_key = await APIKey.get(id=key["id"])
             log = await RequestLog.filter(api_key_id=key["id"], status_code=200).get()
@@ -140,6 +145,16 @@ async def run():
             assert log.tenant_id == tenant.id
             daily = await UsageDaily.get(api_key_id=key["id"])
             assert daily.cost == log.cost and daily.tenant_id == tenant.id
+
+            assert (await client.get("/api/logs", headers=a)).status_code == 404, "bodies hidden from tenants"
+            assert (await client.get("/api/audit/keys", headers=a)).status_code == 404
+            bill = (await client.get("/api/keys/bill", headers=a)).json()
+            row = next(item for item in bill["items"] if item["api_key_id"] == key["id"])
+            assert row["request_count"] == 1 and Decimal(str(row["written"])) == log.cost, "tenant bill"
+            exported = await client.get("/api/keys/bill.csv", headers=a)
+            assert exported.status_code == 200 and "并发请求可能一起越过额度" in exported.text
+            assert "127.0.0.1" not in exported.text and key["key"] not in exported.text, "bill leaks nothing"
+            assert (await client.get(f"/api/keys/bill?tenant_id={tenant.id}", headers=b)).status_code == 404
 
             quota_body = {"quota_total": "0.015", "reason": "smoke ceiling", "operation_id": str(uuid4())}
             quota_path = f"/api/tenants/{tenant.id}/quota"
@@ -158,7 +173,8 @@ async def run():
             assert (await Tenant.get(id=tenant.id)).quota_used == Decimal("0.015")
             assert (await client.get("/v1/models", headers=application)).status_code == 401
         print("PASS: platform and tenant login, temporary password, JWT revocation, key CRUD, isolation,")
-        print("      real inference, MySQL/Redis accounting, quota idempotence/rejection, disable and replacement")
+        print("      real inference, MySQL/Redis accounting, tenant bill/export, hidden audit,")
+        print("      quota idempotence/rejection, disable and replacement")
     finally:
         upstream.shutdown()
         keys = list(await APIKey.filter(tenant_id__in=tenant_ids).values_list("id", flat=True)) + platform_key_ids

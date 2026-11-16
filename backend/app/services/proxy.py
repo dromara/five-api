@@ -4,7 +4,6 @@
 """
 
 import json
-import asyncio
 from datetime import datetime, timezone
 import logging
 import time
@@ -276,6 +275,7 @@ async def _queue_charge(payload: dict, cost: Decimal, api_key: APIKey) -> bool:
         await fast_billing.enqueue(payload, cost, api_key.id, api_key.tenant_id)
         return True
     except Exception:
+        # Admission already proved Redis reachable; losing it mid-request must not lose the charge.
         logger.exception("Spend queue unavailable request_id=%s; settling directly", payload["request_id"])
         return False
 
@@ -327,13 +327,8 @@ async def _bill_and_log(
     payload = redact(payload)
     if uncertain and budget is not None:
         try:
-            if budget.reserved:
-                await Settlement.filter(request_id=request_id, state="reserved").update(
-                    state="uncertain", payload={**payload, "usage_source": "unknown"},
-                    last_error="Upstream outcome unknown; manual reconciliation required",
-                )
-            elif not await _queue_charge({**payload, "usage_source": "unknown"}, Decimal(0), api_key):
-                await save_request_log(**{**payload, "usage_source": "unknown"})
+            await settlements.hold_unknown(request_id, api_key.id, api_key.tenant_id, budget.estimate,
+                                           budget.quotes, {**payload, "usage_source": "unknown"})
         finally:
             await budget.finish(budget.estimated_tokens)
         return
@@ -364,15 +359,13 @@ async def _bill_and_log(
         price_error = type(exc).__name__
         logger.error("Billing requires review request_id=%s error=%s", request_id, price_error)
     try:
-        queued = budget is not None and not budget.reserved and cost is not None \
-            and await _queue_charge(payload, cost, api_key)
+        queued = budget is not None and cost is not None and await _queue_charge(payload, cost, api_key)
         if not queued:
-            if budget is None or not budget.reserved:
-                # Internal callers, unpriced usage and failed queue writes keep a durable accounting record.
-                await Settlement.get_or_create(request_id=request_id, defaults={
-                    "tenant_id": api_key.tenant_id, "api_key_id": api_key.id,
-                    "occupied": cost or Decimal(0), "owner_id": settlements.OWNER_ID,
-                })
+            # Internal callers, unpriced usage and a queue lost after the upstream call keep a durable record.
+            await Settlement.get_or_create(request_id=request_id, defaults={
+                "tenant_id": api_key.tenant_id, "api_key_id": api_key.id,
+                "occupied": cost or Decimal(0), "owner_id": settlements.OWNER_ID, "dispatched": True,
+            })
             await settlements.persist_usage(request_id, payload, cost, price_error)
             try:
                 await settlements.apply(request_id, (api_key.tenant_id, api_key.id))

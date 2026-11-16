@@ -62,6 +62,7 @@ class TenantResponse(BaseModel):
     quota_reset_day: int | None
     window_limits: dict[str, float] = Field(default_factory=dict)
     window_spend: dict[str, float] = Field(default_factory=dict)
+    exhausted: list[str] = Field(default_factory=list)
     is_enabled: bool
     allowed_models: list[str]
     max_keys: int

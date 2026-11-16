@@ -79,7 +79,7 @@ async def test_chat_does_not_fall_back_to_anthropic_channel(client):
             json={"model": "claude-only", "messages": [{"role": "user", "content": "hi"}]},
             headers=auth_header(raw),
         )
-    assert resp.status_code == 404
+    assert resp.status_code == 503 and resp.json()["error"]["code"] == "no_available_channel"
     http.post.assert_not_awaited()
 
 
@@ -102,7 +102,7 @@ async def test_messages_does_not_fall_back_to_openai_channel(client):
             json={"model": "gpt-only", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]},
             headers=auth_header(raw),
         )
-    assert resp.status_code == 404
+    assert resp.status_code == 503 and resp.json()["error"]["code"] == "no_available_channel"
     http.post.assert_not_awaited()
 
 

@@ -289,6 +289,21 @@ async def record_outcome(status_code: int) -> None:
 
 _SCOPE_LABELS = {"key": "Key", "team": "团队"}
 _BUDGET_LABELS = {"quota": "总额度"}
+_EXHAUSTED_LABELS = {"key": "Key 总额度", "tenant": "租户总额度",
+                     "key_window": "Key {window} 滚动限额", "tenant_window": "租户 {window} 滚动限额"}
+
+
+async def quota_exhausted(api_key: APIKey, tenant_name: str, scope: str, window: str = "") -> None:
+    """A request was refused because a budget is used up; tell the platform once per budget and window."""
+    budget = _EXHAUSTED_LABELS[scope].format(window=window)
+    owner_id = api_key.tenant_id if scope.startswith("tenant") else api_key.id
+    await notify(
+        "budget", f"exhausted:{scope}:{owner_id}:{window}", f"额度用尽 {tenant_name}",
+        f"租户 {tenant_name} 的 Key {api_key.name}（{api_key.key_prefix}…）：{budget}已用尽，新请求被拒绝。",
+        {"tenant_id": api_key.tenant_id, "tenant": tenant_name, "key_id": api_key.id, "key": api_key.name,
+         "budget": scope, "window": window},
+        BUDGET_DEDUPE,
+    )
 
 
 async def check_budget(api_key_id: int) -> None:

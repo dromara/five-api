@@ -25,7 +25,7 @@
 
 Five API 是一个多租户 AI 网关。你接入 OpenAI、Claude、Gemini、DeepSeek、通义千问等上游，给每个租户开户、分配美元额度；租户自己创建 Key，只能花自己的额度，每一次调用都按实际服务的渠道精确记账。
 
-- **对外转售**：租户是你的客户。缺价不放行，逐笔可对账；要求余额一分都不能超时切到严格模式。
+- **对外转售**：租户是你的客户。缺价不放行，逐笔可对账；记账不可用时直接拒绝，不先放行后补账。
 - **企业内部**：租户是部门、团队或项目。部门预算与成本分摊、限流、请求审计与泄密排查。
 
 ## 为什么选 Five API
@@ -57,28 +57,28 @@ OpenAI SDK 把 `base_url` 改成 `http://服务器IP:8080/v1`，Anthropic SDK �
 ## 功能
 
 <details open>
-<summary><b>精确计费</b> - 每一笔都能对上，余额管控松紧可选</summary>
+<summary><b>精确计费</b> - 每一笔都能对上，只扣一次</summary>
 
 <br>
 
-- **两种计费模式**（`BILLING_MODE`）：
-  - 默认 `fast`：和 LiteLLM 一样先放行，余额只看已入库花费加 Redis 里待入库的花费，不加锁；花费进 Redis 队列，后台每 0.5 秒整批写入 MySQL。吞吐约为严格模式的 2.5 倍，但同一时刻并发的请求可能一起越过余额，超出部分照实扣费。
-  - `strict`：先足额预占再调上游。按输入加最大输出估算费用，在 MySQL 行锁事务里连同所有在途请求核对 Key 和租户余额，够才放行；多进程、多 Key 并发打同一个租户也不会一起越过余额，记账不可用时直接拒绝。
+- **先放行、批量入库**：和 LiteLLM 一样，准入时比较 Key 和租户的已用、Redis 里待入库的花费、结果未知请求的占用与额度，不加锁、不预占；花费进 Redis 队列，后台每 0.5 秒整批写入 MySQL。同一时刻并发的请求可能一起越过余额，超出部分照实扣费。
+- **记账不可用就拒绝**：读不到 Redis 里的待入库花费时返回 503 `accounting_unavailable`，上游不会被调用。
 - **没配价格不放行**：模型没配售价时拒绝请求，不按 0 记账；只有显式填 0 才免费。
 - **价格在请求前锁定**：中途调价不影响已发出的请求。
-- **扣费、日志同一事务**：Key 扣费、租户扣费、请求日志、日用量要么都写入，要么都不写；记账失败后台恢复且只恢复一次，上游结果未知的请求继续占着额度等人工核对。
+- **扣费、日志同一事务**：Key 扣费、租户扣费、请求日志、日用量要么都写入，要么都不写；写库失败或进程退出时整批退回重写，按请求号只扣一次；上游结果未知的请求按预估继续占着额度，等人工核对。
 - **断流也计费**：客户端中途断开按已转发内容计费；上游没返回用量时按内容估算并标明来源。
 - **四档计价**：输入、缓存读、缓存写、输出分别计价，图片、语音、视频可按次计价。
 
-严格模式下实际用量超出预估时照实扣费、不会少收，余额可能出现一次请求范围内的小额负数（例如没设 `max_tokens` 却输出超过 4096 token）。每条保证都有自动化测试，CI 每次提交都跑：
+并发越过余额的部分照实扣费、不会少收，余额可能出现小额负数，额度用完后的新请求直接拒绝。每条保证都有自动化测试，CI 每次提交都跑：
 
 | 保证 | 测试 |
 | --- | --- |
-| 严格模式：用量在预估内时，预占覆盖每一笔扣费；多进程共享余额不超卖 | `test_end_to_end_charge_never_exceeds_the_reservation`、`test_two_workers_never_overspend_a_shared_tenant_budget` |
-| 默认模式：待入库花费计入余额；写库失败或进程退出后整批退回，恰好扣一次 | `tests/test_fast_billing.py` |
+| 待入库花费计入余额；写库失败或进程退出后整批退回，恰好扣一次 | `tests/test_fast_billing.py` |
+| 多进程共享余额，每笔放行的请求恰好扣一次 | `test_two_workers_charge_every_admitted_request_exactly_once` |
+| 记账不可用时拒绝，不调上游 | `test_redis_down_refuses_before_the_upstream_call` |
 | 缺价不放行、不按 0 计 | `test_unpriced_model_does_not_reach_upstream`、`test_selling_quote_never_silently_prices_at_zero` |
 | 价格锁定 | `test_selling_price_is_snapshotted_before_the_upstream_call` |
-| 记账失败恰好恢复一次，结果未知继续占额度 | `test_accounting_rolls_back_and_recovers_exactly_once`、`test_timeout_keeps_unknown_work_occupied` |
+| 记账失败恰好恢复一次，结果未知继续占额度 | `test_accounting_rolls_back_and_recovers_exactly_once`、`test_unknown_outcome_holds_its_estimate_until_resolved` |
 | 断流计费、不重放上游 | `test_real_http_stream_and_client_cancellation_releases_leases`、`test_disconnect_after_first_byte_does_not_replay_upstream` |
 
 ```bash
@@ -100,6 +100,7 @@ cd backend && ../.venv/bin/pytest -q tests/test_billing_invariants.py tests/test
 - 租户和 Key 两层额度、RPM、TPM、并发限制，以及 5 小时、1 天、7 天滚动限额，额度可按月自动重置；租户下所有 Key 共享租户额度。
 - Key 可设 IP 白名单、可用模型、可用渠道、过期时间；明文只显示一次，撤销后保留用量记录。
 - 平台可以给自己创建自用 Key，自动归入内部空间，和客户账目分开。
+- 租户在 Key 页能看到自己可调用模型的价格（按 Key 的模型和渠道范围），以及哪一项额度已用尽；「账单」页签按日期列出每个 Key 的请求数、已入库和尚未入库的花费，可导出 CSV。
 
 ![租户账号](docs/images/tenants.png)
 
@@ -111,7 +112,7 @@ cd backend && ../.venv/bin/pytest -q tests/test_billing_invariants.py tests/test
 <br>
 
 - 每个渠道按模型售价乘以价格倍率，或给单个模型设固定价；按实际服务的渠道计费。
-- Key 可以限定渠道，只在所选渠道间选路和切换，按候选中最贵的报价预占。
+- Key 可以限定渠道，只在所选渠道间选路和切换；结果未知时按候选中最贵的报价占用额度。
 - 优先级分层，同层按权重、最少在途或最低延迟选路；多 Key 号池、粘性会话、模型回退链。
 - 5xx、超时、429、上游 Key 失效自动切换渠道，流式在首包前切换；连续失败自动熔断；图片、视频等不幂等请求不重复提交。
 
@@ -124,7 +125,8 @@ cd backend && ../.venv/bin/pytest -q tests/test_billing_invariants.py tests/test
 
 <br>
 
-- 按 Key 保存请求内容（不保存回复），自动扫描私钥、AWS、GitHub、Slack 等密钥，不阻断调用；命中的密钥存库前打码，只留类型。
+- 按 Key 保存请求内容（不保存回复），自动扫描私钥、AWS、GitHub、Slack 等密钥，不阻断调用；命中的密钥进入队列前就打码，只留类型、位置和不可还原的 8 位指纹。
+- 正文、扫描结果和报告只有平台管理员能看，租户访问一律 404；管理员每次查看正文、下载报告都留下记录。
 - 员工离职或怀疑泄密时，在审计页选中 Key，让便宜模型逐条审查最近的请求，生成可下载的审计报告；审过的不重复送审。
 
 ![审计报告](docs/images/audit.png)
@@ -179,11 +181,12 @@ Cursor 需要公网 HTTPS 网关，尚未实测。完整说明和常见问题见
 </details>
 
 <details>
-<summary><b>省钱与安全</b> - 缓存洞察、自动降级、密钥隔离</summary>
+<summary><b>省钱与安全</b> - 缓存洞察、额度用尽即拒绝、密钥隔离</summary>
 
 <br>
 
-- 成本洞察按天看缓存命中和节省金额；Anthropic 请求可自动加缓存标记；额度接近上限时自动降级到便宜模型。
+- 成本洞察按天看缓存命中和节省金额；Anthropic 请求可自动加缓存标记。
+- 额度用尽直接拒绝，不偷换便宜模型；缺价、额度用尽、无可用渠道各有固定的状态码和错误码，额度用尽时告警通知平台。
 - 上游 Key 加密存储，可配置自有加密密钥，与登录密钥分离且不入库。
 - 控制台支持中文和英文。
 
@@ -205,7 +208,7 @@ Cursor 需要公网 HTTPS 网关，尚未实测。完整说明和常见问题见
 | | Five API | [new-api](https://github.com/QuantumNous/new-api) | [LiteLLM](https://github.com/BerriAI/litellm) |
 |---|---|---|---|
 | 定位 | 平台开户，按客户或部门分账 | 公开中转站，自助注册、在线充值 | 企业内部出口，100+ 供应商 |
-| 预扣费 | 默认不预扣，按已用加待入库花费放行；`strict` 模式输入加输出上限足额预占，MySQL 事务核对 | 只预扣估算输入；余额超 10 美元跳过预扣 | 不预扣，依赖 Redis，硬上限需另开 fail-closed |
+| 预扣费 | 不预扣，按已用加待入库花费放行；读不到 Redis 记账时拒绝 | 只预扣估算输入；余额超 10 美元跳过预扣 | 不预扣，依赖 Redis，硬上限需另开 fail-closed |
 | 未配置价格 | 拒绝请求 | 返回价格错误 | 放行，按 0 记账 |
 | 同机吞吐（默认配置，[实测](docs/BENCHMARK.md)） | 每分钟 4.7–5.3 万次 | 4.3–4.5 万次 | 2.8 万次 |
 | 请求内容审计 | 按 Key 保存，密钥扫描，AI 审查出报告 | 日志不保存请求内容，管理员查看提问的需求标为[无计划](https://github.com/QuantumNous/new-api/issues/7609) | 可开启保存 prompt；密钥检测属[企业版](https://docs.litellm.ai/docs/enterprise) |
@@ -224,10 +227,9 @@ Cursor 需要公网 HTTPS 网关，尚未实测。完整说明和常见问题见
 |---|---|
 | 模拟环境处理上限，默认模式 | 每分钟约 6 万次（4–8 个进程），单个租户也一样；算上后台写库，持续约 3.5–4.7 万次 |
 | 同机对比，算上后台写库 | Five API 每分钟 4.7–5.3 万次，new-api 4.3–4.5 万次，LiteLLM 2.8 万次；p50 延迟分别约 50、85、115 毫秒 |
-| 模拟环境处理上限，`strict` 模式 | 多个租户合计每分钟约 2.4 万次；单个租户约 8400 次 |
 | 真实 DeepSeek，同时 10–50 个流式请求 | 全部成功，首字只比直连慢 6–19 毫秒 |
 
-`strict` 模式下单个租户的请求要经过同一行锁，这是余额一分不超的代价。测试条件、原始数据和重跑命令见 [压测报告](docs/BENCHMARK.md)。
+测试条件、原始数据和重跑命令见 [压测报告](docs/BENCHMARK.md)。
 
 ## 部署与运维
 
@@ -240,7 +242,6 @@ Cursor 需要公网 HTTPS 网关，尚未实测。完整说明和常见问题见
 | `SECRET_KEY` | 登录令牌密钥；不填时每次重启登录失效 |
 | `ENCRYPTION_KEY` | 上游 Key 的加密密钥；不填时用内置公开密钥加密，已有渠道后再设置须先迁移 |
 | `WORKERS` | 进程数，默认按 CPU 核数，最多 8 |
-| `BILLING_MODE` | `fast`（默认，先放行、批量入库，并发时可能超出余额）或 `strict`（足额预占，余额不超） |
 | `ports` | 默认对外 8080 |
 
 <details>
@@ -274,7 +275,7 @@ cd backend && ../.venv/bin/pytest -q
 | 目录 | 职责 |
 | --- | --- |
 | `backend/app/routers/` | 管理 API 与 OpenAI、Anthropic 推理入口 |
-| `backend/app/services/` | 计费、预占结算、路由、限流、审计 |
+| `backend/app/services/` | 计费队列与结算、路由、限流、审计 |
 | `backend/app/providers/` | 上游适配 |
 | `backend/tests/` | 快测与连真实 MySQL、Redis 的集成测试 |
 | `frontend/src/` | 管理控制台 |

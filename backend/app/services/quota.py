@@ -22,13 +22,14 @@ logger = logging.getLogger(__name__)
 
 class QuotaExceeded(Exception):
     _DETAILS = {
-        "key": (429, "quota_exceeded", "Key spending quota exceeded"),
-        "tenant": (429, "tenant_quota_exceeded", "Tenant spending quota exceeded"),
+        "key": (429, "quota_exceeded", "API key quota is used up; raise the key quota or wait for its reset"),
+        "tenant": (429, "tenant_quota_exceeded",
+                   "Tenant quota is used up; ask the platform administrator to raise it"),
         "tenant_disabled": (403, "tenant_disabled", "Tenant is disabled"),
-        "key_disabled": (401, "key_disabled", "API key is unavailable"),
-        "duplicate_request": (409, "duplicate_request", "Internal request already reserved"),
-        "key_window": (429, "window_limit", "Key {window} spending limit reached"),
-        "tenant_window": (429, "tenant_window_limit", "Tenant {window} spending limit reached"),
+        "key_window": (429, "window_limit",
+                       "API key {window} spending limit reached; wait for the window to roll over"),
+        "tenant_window": (429, "tenant_window_limit",
+                          "Tenant {window} spending limit reached; wait for the window to roll over"),
     }
 
     def __init__(self, key_id: int, scope: str = "key", window: str = ""):
@@ -45,12 +46,22 @@ class QuotaExceeded(Exception):
     def message(self): return self._DETAILS[self.scope][2].format(window=self.window)
 
 
+async def exhausted(api_key: APIKey, tenant_name: str, scope: str, window: str = "") -> QuotaExceeded:
+    """The refusal for a used-up budget, after notifying the platform; notification never blocks it."""
+    from app.services.alerts import quota_exhausted
+    try:
+        await quota_exhausted(api_key, tenant_name, scope, window)
+    except Exception:
+        logger.exception("Quota exhaustion alert failed key_id=%s", api_key.id)
+    return QuotaExceeded(api_key.id, scope, window)
+
+
 async def check_quota(api_key: APIKey) -> bool:
     return api_key.quota_total == -1 or api_key.quota_used < api_key.quota_total
 
 
 async def deduct_quota(api_key_id: int, cost: Decimal) -> None:
-    # Administrative/unit-use helper. Production billing uses settlements.apply().
+    # Administrative/unit-use helper. Production billing goes through fast_billing or settlements.apply().
     if cost > 0:
         await APIKey.filter(id=api_key_id).update(quota_used=F("quota_used") + cost)
 
@@ -60,7 +71,7 @@ async def occupied_quota(scope: str, owner_id: int) -> Decimal:
 
 
 class RequestLease:
-    """SQL reservation plus tenant concurrency and both token reservations."""
+    """Price snapshot, tenant concurrency and both token reservations for one admitted request."""
     def __init__(self, api_key_id: int, request_id: str, tpm_limit: int, tenant_id: int = 0):
         self.api_key_id, self.request_id = api_key_id, request_id
         self.tpm_limit, self.tenant_id = tpm_limit, tenant_id
@@ -69,7 +80,8 @@ class RequestLease:
         self.tenant_lease_id = ""
         self.estimated_input = 0
         self.quotes = {}
-        self.reserved = False
+        # The most this request can cost; held for review when its upstream outcome is unknown.
+        self.estimate = Decimal(0)
         self.dispatched = False
         self.estimated_tokens = 0
         self.closed = False
@@ -80,28 +92,19 @@ class RequestLease:
             await self._clear(actual_tokens)
 
     async def release(self) -> None:
+        """End a request that was never billed. Once dispatched, the upstream may have charged for it."""
         if self.closed:
             return
         self.closed = True
         try:
-            if self.reserved:
-                if self.dispatched:
-                    await settlements.abandon(self.request_id)
-                else:
-                    await settlements.release(self.request_id)
+            if self.dispatched:
+                await settlements.hold_unknown(self.request_id, self.api_key_id, self.tenant_id,
+                                               self.estimate, self.quotes, None)
         finally:
             await self._clear(self.estimated_tokens if self.dispatched else None)
 
     async def before_send(self):
-        if not self.reserved:
-            self.dispatched = True
-        if not self.dispatched:
-            try:
-                await settlements.mark_dispatched(self.request_id)
-            except Exception:
-                raise HTTPException(503, {"error": {"type": "api_error", "code": "accounting_unavailable",
-                                                    "message": "Accounting unavailable; upstream was not called"}}) from None
-            self.dispatched = True
+        self.dispatched = True
 
     async def _clear(self, actual_tokens):
         for owner, limit, amount, scope in (
@@ -133,19 +136,17 @@ async def begin_request_budget(api_key: APIKey, request_id: str, body: dict | No
     if input_tokens_override is not None:
         input_tokens = input_tokens_override
     lease.estimated_input = input_tokens
-    fast = fast_billing.enabled()
     try:
         for scope, owner in (("key", api_key), ("tenant", tenant)):
             limits = normalize_limits(owner.window_limits)
             if not limits:
                 continue
-            held = Decimal(0) if fast else await settlements.occupied(scope, owner.id)
             # Preserve the existing Redis namespace when evolving Team into Tenant.
-            window = await exceeded_window("team" if scope == "tenant" else scope, owner.id, limits, held)
+            window = await exceeded_window("team" if scope == "tenant" else scope, owner.id, limits, Decimal(0))
             if window:
-                raise QuotaExceeded(api_key.id, f"{scope}_window", window)
+                raise await exhausted(api_key, tenant.name, f"{scope}_window", window)
         lease.quotes = await snapshot_quotes(str((body or {}).get("model") or ""), candidates)
-        estimate = estimate_quotes(lease.quotes, input_tokens, output_tokens, request_units)
+        lease.estimate = estimate_quotes(lease.quotes, input_tokens, output_tokens, request_units)
         tokens = input_tokens + output_tokens
         lease.estimated_tokens = tokens
         await rate_limiter.reserve_tpm(api_key.id, api_key.tpm_limit, tokens)
@@ -154,16 +155,13 @@ async def begin_request_budget(api_key: APIKey, request_id: str, body: dict | No
         await rate_limiter.reserve_tpm(tenant.id, tenant.tpm_limit, tokens, scope="tenant")
         if tenant.tpm_limit != -1:
             lease.tenant_tpm_reserved = tokens
-        if fast:
+        try:
             scope = await fast_billing.over_budget(api_key, tenant)
-            if scope:
-                raise QuotaExceeded(api_key.id, scope)
-        else:
-            try:
-                await settlements.reserve(lease.request_id, api_key, estimate, lease.quotes)
-            except settlements.BudgetDenied as exc:
-                raise QuotaExceeded(api_key.id, exc.scope)
-            lease.reserved = True
+        except fast_billing.AccountingUnavailable:
+            raise HTTPException(503, {"error": {"type": "api_error", "code": "accounting_unavailable",
+                                                "message": "Accounting unavailable; upstream was not called"}}) from None
+        if scope:
+            raise await exhausted(api_key, tenant.name, scope)
         lease.tenant_lease_id = await concurrency_limiter.acquire(tenant.id, tenant.concurrent_limit, scope="tenant")
     except BaseException:
         await lease.release()

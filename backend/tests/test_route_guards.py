@@ -18,6 +18,7 @@ PUBLIC = {("POST", "/api/login"), ("GET", "/healthz"), ("GET", "/metrics"), ("GE
 SELF_SERVICE = {("GET", "/api/me"), ("PUT", "/api/password")}
 TENANT_PREFIX = "/api/keys"
 ANTHROPIC_PREFIX = "/v1/messages"
+AUDIT_PREFIXES = ("/api/logs", "/api/audit")
 
 
 def _flatten(routes, prefix=""):
@@ -55,6 +56,8 @@ def _access(method: str, path: str) -> str:
         return "anthropic"
     if path.startswith("/v1/"):
         return "inference"
+    if path.startswith(AUDIT_PREFIXES):
+        return "audit"
     if path.startswith("/api/"):
         return "platform"
     return "unclassified"
@@ -65,6 +68,7 @@ GUARDS = {
     "self": "get_current_admin",
     "account": "require_account",
     "platform": "require_platform_admin",
+    "audit": "require_audit_reader",
     "inference": "verify_api_key",
     "anthropic": "verify_api_key_anthropic",
 }
@@ -100,6 +104,7 @@ def test_route_declares_the_guard_for_its_class(method, path, deps):
 GUARDED = [row for row in ROUTES if _access(row[0], row[1]) != "public"]
 MANAGEMENT = [row for row in GUARDED if row[1].startswith("/api/")]
 PLATFORM = [row for row in GUARDED if _access(row[0], row[1]) == "platform"]
+AUDIT = [row for row in GUARDED if _access(row[0], row[1]) == "audit"]
 INFERENCE = [row for row in GUARDED if row[1].startswith("/v1/")]
 
 
@@ -121,6 +126,13 @@ async def test_tenant_account_cannot_reach_platform_routes(client, method, path,
     _, _, headers = await create_tenant_account()
     response = await _call(client, method, path, headers)
     assert response.status_code == 403
+
+
+@pytest.mark.parametrize("method,path,deps", AUDIT, ids=_ids(AUDIT))
+async def test_request_bodies_do_not_exist_for_tenant_accounts(client, method, path, deps):
+    _, _, headers = await create_tenant_account()
+    response = await _call(client, method, path, headers)
+    assert response.status_code == 404
 
 
 @pytest.mark.parametrize("method,path,deps", MANAGEMENT, ids=_ids(MANAGEMENT))

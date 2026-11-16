@@ -29,11 +29,11 @@ FastAPI、Tortoise ORM、MySQL 8、Redis 7；Vue 3、Element Plus。开发使用
 
 内部 UUID → Key/租户状态、模型、IP、RPM → 候选路由 → selling_quote 快照 → 两层 TPM、额度准入、两层并发 → 上游 → 扣费 → 后台恢复。
 
-BILLING_MODE 默认 fast（同 LiteLLM）：准入只比较 quota_used + Redis 待入库花费，不加锁，并发可越过余额；有报价的花费 RPUSH 到 five:billing:queue 并累加 pending 计数，fast_billing.flush_loop 每个 worker 用 Lua 移入自己的 processing 列表，整批写日志、usage_daily、quota_used 后再删列表、减 pending；失败退回队列，死 worker 的列表由 recover_orphans 退回，按 request_id 去重保证只扣一次。缺价、入队失败、无预算的内部调用走 Settlement。strict：SQL 足额预占 → 持久化 dispatched → 上游 → 持久化用量 → SQL 事务结算。
+计费只有一种（同 LiteLLM，无 BILLING_MODE）：准入比较 quota_used + Redis 待入库花费 + held 占用，不加锁，并发可越过余额；读不到 Redis 计数返回 503 accounting_unavailable，不调上游；有报价的花费 RPUSH 到 five:billing:queue 并累加 pending 计数，fast_billing.flush_loop 每个 worker 用 Lua 移入自己的 processing 列表，整批写日志、usage_daily、quota_used 后再删列表、减 pending；失败退回队列，死 worker 的列表由 recover_orphans 退回，按 request_id 去重保证只扣一次。缺价、入队失败、无预算的内部调用走 Settlement 并 SQL 事务结算；上游结果未知写 uncertain Settlement 并按预估累加 five:billing:held，恢复循环按 Settlement 占用重建 held 计数。
 
 事务锁顺序统一为 Tenant → APIKey → Settlement。同一笔的 Key、租户扣费、请求日志和 usage_daily 必须同时提交。结算失败不能让已完成的上游调用重放；未知结果继续占用供核对。滚动限额的 Redis team 前缀保留用于继承旧数据。
 
-客户价按实际服务渠道计算：渠道 price_overrides 有该模型时用固定价，否则 ModelPrice（或参考目录）× 渠道 price_multiplier；ModelPrice 停用时即使有固定价也拒绝。Key channel_ids 非空时只在其中选路和故障切换，按候选中最贵的报价预占。不记录上游成本。报价缺失不静默记 0，显式零价有效。缓存读、缓存写、输入、输出分别计量；Anthropic input_tokens 不含缓存，要先补齐为 OpenAI prompt_tokens 口径。
+客户价按实际服务渠道计算：渠道 price_overrides 有该模型时用固定价，否则 ModelPrice（或参考目录）× 渠道 price_multiplier；ModelPrice 停用时即使有固定价也拒绝。Key channel_ids 非空时只在其中选路和故障切换，结果未知时按候选中最贵的报价占用。不记录上游成本。报价缺失不静默记 0，显式零价有效。缓存读、缓存写、输入、输出分别计量；Anthropic input_tokens 不含缓存，要先补齐为 OpenAI prompt_tokens 口径。
 
 流式仅首包前切换；清理须保留 anyio shield，正确处理取消。显式 0 用量与缺失用量分开记录，缺失字段估算并标明 usage_source。
 

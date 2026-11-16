@@ -4,6 +4,10 @@
       <div><h3>{{ t('nav.keys') }}</h3><p>{{ t('keys.scopeHint') }}</p></div>
       <el-button type="primary" @click="openCreate">{{ t('keys.create') }}</el-button>
     </div>
+    <el-alert v-if="summary?.exhausted?.length" type="error" :closable="false" show-icon style="margin-bottom: 16px"
+      :title="t('keys.exhaustedTenant', { budget: summary.exhausted.map(budgetLabel).join(', ') })" />
+    <el-alert v-if="exhaustedKeys" type="warning" :closable="false" show-icon style="margin-bottom: 16px"
+      :title="t('keys.exhaustedKeys', { keys: exhaustedKeys })" />
     <el-card v-if="summary" shadow="never" style="margin-bottom: 16px">
       <p>{{ t('tenants.sharedLimits') }}：{{ summary.rpm_limit }} / {{ summary.tpm_limit }} / {{ summary.concurrent_limit }}</p>
       <el-descriptions :column="4">
@@ -13,6 +17,8 @@
         <el-descriptions-item :label="t('keys.remain')">{{ money(summary.quota_remaining) }}</el-descriptions-item>
       </el-descriptions>
     </el-card>
+    <el-tabs v-model="tab">
+    <el-tab-pane :label="t('keys.tabKeys')" name="keys">
     <el-card shadow="never">
       <el-table :data="keys" v-loading="loading" stripe>
         <el-table-column prop="name" :label="t('common.name')" min-width="140" />
@@ -26,6 +32,9 @@
         <el-table-column :label="t('keys.quota')" min-width="180">
           <template #default="{ row }">
             {{ money(row.quota_used) }} / {{ row.quota_total === -1 ? t('keys.shared') : money(row.quota_total) }}
+            <el-tag v-for="budget in row.exhausted || []" :key="budget" size="small" type="danger" effect="plain" class="exhausted-tag">
+              {{ t('keys.exhaustedTag', { budget: budgetLabel(budget) }) }}
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column :label="t('common.enabled')" width="90">
@@ -47,6 +56,14 @@
       <el-pagination v-if="total" :current-page="page" :page-size="20" :total="total"
         layout="total, prev, pager, next" @current-change="(p: number) => { page = p; load() }" />
     </el-card>
+    </el-tab-pane>
+    <el-tab-pane :label="t('keys.tabPrices')" name="prices" lazy>
+      <el-card shadow="never"><ModelPricePanel :keys="keys.filter(key => !key.is_revoked)" /></el-card>
+    </el-tab-pane>
+    <el-tab-pane v-if="!auth.isPlatformAdmin" :label="t('keys.tabBill')" name="bill" lazy>
+      <el-card shadow="never"><KeyBillPanel /></el-card>
+    </el-tab-pane>
+    </el-tabs>
 
     <el-dialog v-model="dialog" :title="editingId ? t('keys.edit') : t('keys.create')" width="540px">
       <el-alert v-if="auth.isPlatformAdmin && !editingId" :title="t('keys.platformOwnHint')" type="info" :closable="false" style="margin-bottom:16px" />
@@ -154,6 +171,8 @@ import { useAuthStore } from '@/stores/auth'
 import { useI18n } from '@/i18n'
 import { useRoute } from 'vue-router'
 import WindowLimitsInput from '@/components/WindowLimitsInput.vue'
+import KeyBillPanel from '@/components/KeyBillPanel.vue'
+import ModelPricePanel from '@/components/ModelPricePanel.vue'
 
 const auth = useAuthStore()
 const route = useRoute()
@@ -164,6 +183,7 @@ const availableModels = ref<string[]>([])
 const page = ref(1), total = ref(0), editingId = ref<number | null>(null)
 const loading = ref(false), saving = ref(false), dialog = ref(false), showRaw = ref(false), showDetail = ref(false)
 const raw = ref('')
+const tab = ref('keys')
 const defaults = () => ({ name: '', quota_total: -1, allowed_models: [] as string[], allowed_ips: [] as string[],
   channel_ids: [] as number[], expires_at: null as string | null, concurrent_limit: 5, rpm_limit: -1, tpm_limit: -1 })
 const platformDefaults = () => ({ model_group_id: null as number | null, quota_reset_day: null as number | null,
@@ -186,6 +206,14 @@ const selectedPrices = computed(() => channelOptions.value
     input: entry.prices ? '$' + formatPrice(entry.prices.prompt) : '—',
     output: entry.prices ? '$' + formatPrice(entry.prices.completion) : '—',
   }))))
+
+function budgetLabel(budget: string) {
+  return budget === 'quota' ? t('keys.budgetQuota') : t('keys.budgetWindow', { window: budget })
+}
+const exhaustedKeys = computed(() => keys.value
+  .filter(key => !key.is_revoked && key.exhausted?.length)
+  .map(key => `${key.name}（${key.exhausted.map(budgetLabel).join(', ')}）`)
+  .join('；'))
 
 function formatPrice(value: number) {
   return value.toLocaleString(undefined, { maximumFractionDigits: 6 })
@@ -307,7 +335,8 @@ onUnmounted(() => { raw.value = '' })
   font-weight: 500;
 }
 
-.fixed-tag {
+.fixed-tag,
+.exhausted-tag {
   margin-left: 4px;
 }
 </style>

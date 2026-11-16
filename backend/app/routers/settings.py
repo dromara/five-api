@@ -27,7 +27,6 @@ class GatewaySettingsBody(BaseModel):
     routing_strategy: Literal["weighted", "least_busy", "latency"] | None = None
     model_fallbacks: dict[str, list[str]] | None = None
     auto_cache_control: bool | None = None
-    budget_downgrade: dict | None = None
 
 
 @router.get("")

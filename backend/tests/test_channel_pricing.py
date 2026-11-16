@@ -9,8 +9,9 @@ import httpx
 import pytest
 
 from app.models import APIKey, Channel, ModelPrice, RequestLog, Settlement
-from app.services import settlements
+from app.services import quota, settlements
 from app.services.auth import hash_api_key
+from app.services.billing_quotes import estimate_quotes
 from tests.conftest import auth_header, create_tenant_account, create_test_tenant
 
 pytestmark = pytest.mark.asyncio
@@ -113,25 +114,25 @@ async def test_disabled_bound_channel_returns_explicit_error(client):
     http = _upstream()
     with patch("app.providers.base._shared_http_client", return_value=http):
         result = await client.post("/v1/chat/completions", json=CHAT, headers=auth_header(RAW_KEY))
-    assert result.status_code == 404
+    assert result.status_code == 503
     assert "selected for this API key" in result.json()["error"]["message"]
     http.post.assert_not_awaited()
 
 
-async def test_reservation_covers_the_dearest_candidate(client):
+async def test_unknown_outcome_hold_covers_the_dearest_candidate(client):
     await ModelPrice.create(model="gpt-4o", prompt_price=2, completion_price=8)
     cheap = await _channel("cheap", priority=10)
     dear = await _channel("dear", priority=0, price_multiplier=Decimal("4"))
     key = await _key([cheap.id, dear.id])
     holds = []
-    original = settlements.reserve
 
-    async def capture(request_id, api_key, amount, quotes):
+    def capture(quotes, *args):
+        amount = estimate_quotes(quotes, *args)
         holds.append((amount, quotes))
-        return await original(request_id, api_key, amount, quotes)
+        return amount
 
     with patch("app.providers.base._shared_http_client", return_value=_upstream()), \
-            patch.object(settlements, "reserve", capture):
+            patch.object(quota, "estimate_quotes", capture):
         assert (await client.post("/v1/chat/completions", json=CHAT, headers=auth_header(RAW_KEY))).status_code == 200
         await APIKey.filter(id=key.id).update(channel_ids=[cheap.id])
         assert (await client.post("/v1/chat/completions", json=CHAT, headers=auth_header(RAW_KEY))).status_code == 200

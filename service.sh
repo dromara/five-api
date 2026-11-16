@@ -64,6 +64,28 @@ stop_apps() {
 
 }
 
+redis_cli() {
+    docker compose exec -T redis redis-cli "$@" 2>/dev/null | tr -d '\r'
+}
+
+enable_redis_aof() {
+    # Redis restarted with appendonly yes ignores an existing RDB snapshot and starts empty,
+    # so switch the old container on first; it writes the AOF from memory before the restart.
+    [ -n "$(docker compose ps -a -q redis 2>/dev/null)" ] || return 0
+    docker compose start redis >/dev/null
+    for _ in $(seq 1 30); do
+        [ "$(redis_cli ping)" = "PONG" ] && break
+        sleep 1
+    done
+    [ "$(redis_cli config get appendonly | tail -n 1)" = "no" ] || return 0
+    echo "==> Enabling Redis AOF before restarting Redis..."
+    redis_cli config set appendonly yes >/dev/null
+    until redis_cli info persistence | grep -q "^aof_rewrite_in_progress:0" &&
+          redis_cli info persistence | grep -q "^aof_rewrite_scheduled:0"; do
+        sleep 0.5
+    done
+}
+
 start() {
     check_deps
     stop_apps
@@ -73,6 +95,7 @@ start() {
 
     # 1. MySQL + Redis
     echo "==> Starting MySQL & Redis..."
+    enable_redis_aof
     docker compose up -d mysql redis
 
     # 2. Wait for MySQL to be ready
@@ -131,6 +154,7 @@ deploy() {
     echo "==> Pulling images and starting gateway, MySQL & Redis..."
     # A locally built image with the same tag is kept when the registry is unreachable.
     docker compose pull --ignore-pull-failures
+    enable_redis_aof
     docker compose up -d
     echo "==> Gateway: http://127.0.0.1:8080 (first login: admin / admin123)"
 }

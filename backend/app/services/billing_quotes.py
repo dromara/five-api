@@ -10,8 +10,9 @@ PUBLIC_PRICE_FIELDS = {"input": "prompt", "output": "completion", "cache_read": 
                        "cache_write": "cache_write", "request": "request"}
 
 
-def _unavailable(message: str) -> HTTPException:
-    return HTTPException(503, {"error": {"type": "api_error", "code": "pricing_unavailable", "message": message}})
+def _not_priced(message: str) -> HTTPException:
+    return HTTPException(400, {"error": {"type": "invalid_request_error", "code": "model_not_priced",
+                                         "message": message}})
 
 
 def quote_names(model: str, alias: str) -> list[str]:
@@ -43,9 +44,10 @@ def pick_quote(model: str, names: list[str], rows: dict[str, ModelPrice], channe
 
     A disabled model price refuses the request even when the channel fixes a price.
     """
+    requested = names[0] if names else model
     row = next((rows[name] for name in names if name in rows), None)
     if row is not None and not row.is_active:
-        raise _unavailable("Model selling price is disabled")
+        raise _not_priced(f"Model {requested} is not on sale; ask the platform administrator to enable its price")
     override = channel_override(channel, names)
     if override is not None:
         return {"model": model, "source": "channel", "prices": override, "multiplier": "1"}
@@ -58,7 +60,7 @@ def pick_quote(model: str, names: list[str], rows: dict[str, ModelPrice], channe
     else:
         catalog = next((name for name in names if name in DEFAULT_MODEL_PRICES), None)
         if catalog is None:
-            raise _unavailable("Configure a selling price before using this model")
+            raise _not_priced(f"Model {requested} has no selling price; ask the platform administrator to set one")
         raw = catalog_prices(catalog)
         source, prices = "catalog", {
             "input": str(raw["prompt"]), "output": str(raw["completion"]),

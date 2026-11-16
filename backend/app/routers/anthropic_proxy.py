@@ -252,7 +252,7 @@ async def messages(
             async for line, usage in _passthrough_stream_with_usage(provider, raw_body, extra_headers):
                 yield line, usage
 
-        upstream_headers = plan.headers
+        upstream_headers: dict[str, str] = {}
         return await open_stream(
             stream_with_failover(
                 plan.candidates, _stream_fn, api_key, "/v1/messages", body.model,
@@ -284,4 +284,4 @@ async def messages(
         security_hits=security_hits,
         budget=budget,
     )
-    return plan.mark(response)
+    return response

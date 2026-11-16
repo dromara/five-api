@@ -23,7 +23,7 @@ from uuid import uuid4
 import httpx
 from tortoise import Tortoise
 
-from app.config import TORTOISE_ORM, settings
+from app.config import TORTOISE_ORM
 from app.dependencies import close_redis, get_redis
 from app.models import APIKey, Channel, ModelPrice, ModelProbe, RequestLog, Settlement, Tenant, UsageDaily
 from app.services import fast_billing
@@ -218,8 +218,7 @@ async def main():
         base = runs[0]["requests_per_second"]
         for run in runs:
             run["speedup"] = round(run["requests_per_second"] / base, 2)
-        report = {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "version": "0.6.2",
-                  "billing_mode": settings.BILLING_MODE,
+        report = {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "version": "0.7.0",
                   "python": platform.python_version(), "platform": platform.platform(), "cpu_count": os.cpu_count(),
                   "tenants": args.tenants, "concurrency": args.concurrency, "requests": args.requests,
                   "upstream_delay_ms": args.upstream_ms, "load_processes": args.clients,

@@ -192,7 +192,7 @@ async def _proxy(
         openai_error(status, error_type, code, message)
 
     if stream_fn is not None:
-        upstream_headers = plan.headers
+        upstream_headers: dict[str, str] = {}
         return await open_stream(
             stream_with_failover(
                 plan.candidates, stream_fn, api_key, endpoint, model,
@@ -219,7 +219,7 @@ async def _proxy(
         budget=budget,
         idempotent=idempotent,
     )
-    return plan.mark(response)
+    return response
 
 
 async def _proxy_endpoint(request: Request, body, endpoint: str, api_key: APIKey):

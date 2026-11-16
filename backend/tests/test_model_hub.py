@@ -11,7 +11,7 @@ from app.services import settlements
 from app.services.billing_quotes import quote_cost, selling_quote
 from app.services.quota import begin_request_budget
 from tests.conftest import auth_header, create_tenant_account
-from tests.test_billing_reliability import BODY, MODEL, env, upstream, response
+from tests.test_billing_reliability import BODY, env, upstream, response
 
 pytestmark = pytest.mark.asyncio
 
@@ -30,16 +30,6 @@ async def test_channel_multiplier_is_billed_and_snapshotted(client):
     assert log.cost == Decimal("0.000175")
     assert Decimal(log.cost_detail["multiplier"]) == Decimal("0.5")
     assert log.channel_id == channel.id
-
-
-async def test_channel_multiplier_is_included_in_sufficient_reservation(client):
-    _, keys, channel = await env(quota="0.00005")
-    await Channel.filter(id=channel.id).update(price_multiplier=10)
-    http = upstream()
-    with patch("app.providers.base._shared_http_client", return_value=http):
-        result = await client.post("/v1/chat/completions", json=BODY, headers=auth_header(keys[0][1]))
-    assert result.status_code == 429
-    http.post.assert_not_awaited()
 
 
 async def test_explicit_free_channel_and_alias_quote():
@@ -67,17 +57,17 @@ async def test_alias_price_overrides_upstream_model_price():
 
 
 @pytest.mark.parametrize("stream", [False, True])
-async def test_dispatch_record_failure_returns_503_without_calling_upstream(client, stream):
+async def test_unreadable_spend_returns_503_without_calling_upstream(client, stream, mock_redis):
     _, keys, _ = await env()
     http = upstream()
-    with patch("app.providers.base._shared_http_client", return_value=http), patch(
-            "app.services.settlements.mark_dispatched", side_effect=RuntimeError("DB unavailable")):
+    with patch("app.providers.base._shared_http_client", return_value=http), patch.object(
+            mock_redis, "mget", side_effect=ConnectionError("Redis unavailable")):
         result = await client.post("/v1/chat/completions", json={**BODY, "stream": stream},
                                    headers=auth_header(keys[0][1]))
     assert result.status_code == 503
     assert result.json()["error"]["code"] == "accounting_unavailable"
     http.post.assert_not_awaited()
-    assert await Settlement.filter(state__in=("reserved", "pending", "uncertain")).count() == 0
+    assert not await Settlement.exists()
 
 
 async def test_unknown_outcome_requires_reason_and_is_resolved_once(client, admin_token):

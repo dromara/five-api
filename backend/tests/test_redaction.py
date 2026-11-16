@@ -113,7 +113,7 @@ async def test_stored_audit_content_has_secrets_removed(client):
     log = await RequestLog.get(request_id=resp.headers["x-request-id"])
     audit = await RequestLogAudit.get(request_log_id=log.id)
     assert AWS not in audit.audit_request
-    assert "[REDACTED:aws_access_key]" in audit.audit_request
+    assert "[REDACTED:aws_access_key#" in audit.audit_request
     assert "deploy with" in audit.audit_request
     sent = provider.send_request.await_args.args[0]
     assert AWS in str(sent)

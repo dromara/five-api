@@ -133,39 +133,6 @@ async def test_image_generation_retries_when_upstream_was_never_reached(client):
     assert http.post.await_count == 2
 
 
-async def test_window_cap_counts_in_flight_holds(client):
-    await _channel("w", "sk-a")
-    await ModelPrice.create(model="gpt-4o")
-    key = await _key(window_limits={"5h": 1})
-    await Settlement.create(request_id="held", tenant_id=key.tenant_id, api_key_id=key.id,
-                            occupied=Decimal("1"), state="pending")
-    http = _http(_resp(200, OK))
-    with patch("app.providers.base._shared_http_client", return_value=http):
-        resp = await client.post("/v1/chat/completions", json=CHAT, headers=auth_header(RAW_KEY))
-    assert resp.status_code == 429
-    assert "window_limit" in resp.text
-    assert http.post.await_count == 0
-
-
-async def test_budget_downgrade_counts_in_flight_holds(client):
-    from app.services.settings_service import clear_settings_cache, set_gateway_config
-
-    await _channel("d", "sk-a", models=("big-model", "small-model"))
-    await ModelPrice.create(model="big-model")
-    await ModelPrice.create(model="small-model")
-    key = await _key(quota_total=Decimal("10"), quota_used=Decimal("7"))
-    await Settlement.create(request_id="held", tenant_id=key.tenant_id, api_key_id=key.id,
-                            occupied=Decimal("1.5"), state="pending")
-    await set_gateway_config({"budget_downgrade": {"threshold": 0.8, "rules": {"big-model": "small-model"}}})
-    http = _http(_resp(200, OK))
-    with patch("app.providers.base._shared_http_client", return_value=http):
-        resp = await client.post("/v1/chat/completions", json={**CHAT, "model": "big-model"},
-                                 headers=auth_header(RAW_KEY))
-    clear_settings_cache()
-    assert resp.status_code == 200
-    assert resp.headers["x-five-downgraded-to"] == "small-model"
-
-
 async def test_me_shows_billed_prices_and_tenant_quota(client):
     await _channel("me", "sk-a", models=("gpt-4o", "gpt-5.6", "unpriced-model"),
                    model_mapping={"gpt-4o": "gpt-4o-2026"}, price_multiplier=Decimal("1.5"))

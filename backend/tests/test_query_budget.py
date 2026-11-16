@@ -4,12 +4,10 @@ from decimal import Decimal
 import httpx
 import pytest
 import respx
-from starlette.requests import Request
 from tortoise import Tortoise
 
-from app.models import APIKey, Channel, ModelPrice, Settlement, Tenant
-from app.services.auth import authenticate_api_key, hash_api_key
-from app.services.quota import QuotaExceeded, begin_request_budget
+from app.models import APIKey, Channel, ModelPrice
+from app.services.auth import hash_api_key
 from tests.conftest import auth_header, create_test_tenant
 
 RAW = "sk-query-budget-key"
@@ -52,6 +50,7 @@ async def _measure(client, statements, body=BODY) -> list[str]:
 
 
 @respx.mock
+@pytest.mark.queued_billing
 @pytest.mark.parametrize("stream", [False, True])
 async def test_inference_sql_is_bounded_and_independent_of_pool_size(client, statements, stream):
     respx.post(path="/v1/chat/completions").mock(return_value=httpx.Response(200, json=UPSTREAM))
@@ -65,16 +64,16 @@ async def test_inference_sql_is_bounded_and_independent_of_pool_size(client, sta
     assert len(single) <= REQUEST_SQL_BUDGET, "\n".join(single)
     reads = [sql for sql in single if "request_logs" in sql and not sql.startswith("INSERT")]
     assert not reads, reads
-    assert _tenant_reads_before_reserve(single) == 1, "\n".join(single)
+    assert _tenant_reads(single) == 1, "\n".join(single)
 
 
-def _tenant_reads_before_reserve(sql: list[str]) -> int:
-    unlocked = sql[:sql.index("BEGIN")]
-    return sum(1 for statement in unlocked if statement.startswith("SELECT") and 'FROM "tenants"' in statement)
+def _tenant_reads(sql: list[str]) -> int:
+    return sum(1 for statement in sql if statement.startswith("SELECT") and 'FROM "tenants"' in statement)
 
 
 @respx.mock
-async def test_anthropic_reads_tenant_once_before_reserve(client, statements):
+@pytest.mark.queued_billing
+async def test_anthropic_reads_tenant_once(client, statements):
     respx.post(path="/v1/messages").mock(return_value=httpx.Response(200, json={
         "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-x", "content": [],
         "stop_reason": "end_turn", "usage": {"input_tokens": 5, "output_tokens": 5},
@@ -91,21 +90,8 @@ async def test_anthropic_reads_tenant_once_before_reserve(client, statements):
     statements.clear()
     assert (await client.post("/v1/messages", json=body, headers=headers)).status_code == 200
     assert len(statements) <= REQUEST_SQL_BUDGET, "\n".join(statements)
-    assert _tenant_reads_before_reserve(statements) == 1, "\n".join(statements)
+    assert _tenant_reads(statements) == 1, "\n".join(statements)
 
-
-async def test_tenant_disabled_after_authentication_is_still_denied(client):
-    tenant = await create_test_tenant()
-    await APIKey.create(tenant_id=tenant.id, name="budget", key_hash=hash_api_key(RAW), key_prefix=RAW[:8],
-                        quota_total=Decimal(100))
-    await ModelPrice.create(model="gpt-4o", prompt_price=Decimal(1), completion_price=Decimal(1))
-    request = Request({"type": "http", "headers": [], "client": ("127.0.0.1", 1)})
-    api_key = await authenticate_api_key(request, RAW)
-    await Tenant.filter(id=tenant.id).update(is_enabled=False)
-    with pytest.raises(QuotaExceeded) as denied:
-        await begin_request_budget(api_key, "stale-tenant", BODY)
-    assert denied.value.scope == "tenant_disabled"
-    assert not await Settlement.exists(request_id="stale-tenant")
 
 
 AGGREGATE_STATS = ["overview", "usage", "by-model", "by-key", "by-channel", "by-tenant", "cache", "error-rate"]

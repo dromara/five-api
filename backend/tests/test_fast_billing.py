@@ -1,18 +1,19 @@
-"""BILLING_MODE=fast: admit against cached spend, queue the charge, write it to MySQL in batches."""
+"""Admit against cached spend, queue the charge, write it to MySQL in batches."""
 import json
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from app.models import APIKey, Channel, ModelPrice, RequestLog, RequestLogAudit, Settlement, Tenant, UsageDaily
-from app.services import fast_billing
+from app.services import fast_billing, settlements
 from app.services.auth import hash_api_key
 from app.services.logging_service import save_request_log
 from app.services.settings_service import set_inference_audit_enabled
 from tests.conftest import auth_header
 
-pytestmark = pytest.mark.fast_billing
+pytestmark = pytest.mark.queued_billing
 
 RAW_KEY = "sk-fast-billing-key-0123456789"
 USAGE = {"prompt_tokens": 1000, "completion_tokens": 300, "total_tokens": 1300}
@@ -150,7 +151,70 @@ async def test_batch_of_an_exited_worker_is_returned_and_charged_once(client, se
     assert await fast_billing.backlog() == 0
 
 
-async def test_queue_failure_settles_directly(client, setup):
+async def test_redis_down_refuses_before_the_upstream_call(client, setup, mock_redis):
+    tenant, key, provider = setup
+    with patch.object(mock_redis, "mget", side_effect=ConnectionError("redis down")):
+        response = await _call(client)
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "accounting_unavailable"
+    provider.send_request.assert_not_awaited()
+    await key.refresh_from_db()
+    await tenant.refresh_from_db()
+    assert key.quota_used == tenant.quota_used == 0
+    assert await fast_billing.backlog() == 0 and not await Settlement.exists()
+
+
+async def test_unlimited_budgets_still_need_the_spend_counters(client, setup, mock_redis):
+    tenant, key, provider = setup
+    await Tenant.filter(id=tenant.id).update(quota_total=-1)
+    await APIKey.filter(id=key.id).update(quota_total=-1)
+    with patch.object(mock_redis, "mget", side_effect=ConnectionError("redis down")):
+        assert (await _call(client)).status_code == 503
+    provider.send_request.assert_not_awaited()
+
+
+async def test_unknown_outcome_holds_its_estimate_until_resolved(client, setup, admin_token):
+    tenant, key, provider = setup
+    provider.send_request = AsyncMock(side_effect=httpx.ReadTimeout("no response"))
+    assert (await _call(client)).status_code >= 500
+    record = await Settlement.get()
+    assert record.state == "uncertain" and record.occupied > 0
+    assert record.payload["usage_source"] == "unknown"
+    assert await RequestLog.all().count() == 0 and await fast_billing.backlog() == 0
+
+    # The held estimate uses the whole quota, so the next request is refused.
+    await APIKey.filter(id=key.id).update(quota_total=record.occupied)
+    denied = await _call(client)
+    assert denied.status_code == 429 and denied.json()["error"]["code"] == "quota_exceeded"
+
+    resolved = await client.post(f"/api/settlements/{record.id}/resolve", headers=auth_header(admin_token),
+                                 json={"action": "release", "reason": "upstream confirmed no charge"})
+    assert resolved.status_code == 200
+    provider.send_request = AsyncMock(return_value={"id": "2", "object": "chat.completion", "model": "gpt-4o",
+                                                    "choices": [], "usage": {"prompt_tokens": 1,
+                                                                             "completion_tokens": 1}})
+    assert (await _call(client)).status_code == 200
+
+
+async def test_records_from_older_releases_are_counted_after_a_rebuild(client, setup, admin_token, mock_redis):
+    tenant, key, _ = setup
+    record = await Settlement.create(request_id="legacy", tenant_id=tenant.id, api_key_id=key.id,
+                                     state="uncertain", occupied=key.quota_total, dispatched=True)
+    assert (await _call(client)).status_code == 200
+
+    await settlements.sync_holds()
+    denied = await _call(client)
+    assert denied.status_code == 429 and denied.json()["error"]["code"] == "quota_exceeded"
+
+    resolved = await client.post(f"/api/settlements/{record.id}/resolve", headers=auth_header(admin_token),
+                                 json={"action": "release", "reason": "upstream confirmed no charge"})
+    assert resolved.status_code == 200
+    await settlements.sync_holds()
+    assert not [name async for name in mock_redis.scan_iter(match=fast_billing.HELD_PREFIX + "*")]
+    assert (await _call(client)).status_code == 200
+
+
+async def test_queue_lost_after_the_upstream_call_settles_directly(client, setup):
     tenant, key, _ = setup
     with patch.object(fast_billing, "enqueue", side_effect=ConnectionError("redis down")):
         assert (await _call(client)).status_code == 200

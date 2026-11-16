@@ -25,7 +25,6 @@ from app.services.settings_service import set_gateway_config
 from app.services.sticky_session import make_session_key
 from app.services.proxy import extract_openai_usage
 from app.services.quota import (
-    QuotaExceeded,
     check_quota,
     deduct_quota,
     reset_expired_quotas,
@@ -149,7 +148,7 @@ async def test_calculate_cost_uses_mapped_alias_price():
 async def test_calculate_cost_no_pricing_refuses():
     with pytest.raises(HTTPException) as refused:
         await calculate_cost("unknown-model-xyz", 1000, 500, None)
-    assert refused.value.status_code == 503
+    assert refused.value.status_code == 400
 
 
 async def test_calculate_cost_zero_tokens():
@@ -289,7 +288,7 @@ async def test_inactive_price_refuses_even_with_channel_price():
     for target in (None, channel):
         with pytest.raises(HTTPException) as refused:
             await calculate_cost("inactive-price", 1000, 500, target)
-        assert refused.value.status_code == 503
+        assert refused.value.status_code == 400
 
 
 async def test_catalog_write_price_matches_vendor_rule():
@@ -421,19 +420,6 @@ async def test_check_quota_exceeded():
         quota_total=Decimal("10"), quota_used=Decimal("10"),
     )
     assert await check_quota(k) is False
-
-
-async def test_quota_hold_blocks_a_second_reservation():
-    k = await APIKey.create(tenant_id=(await create_test_tenant()).id,
-        name="hold", key_hash=hash_api_key("sk-hold"), key_prefix="sk-hold0",
-        quota_total=Decimal("1"), quota_used=Decimal("0.40"),
-    )
-    from app.services import settlements
-    await settlements.reserve("req-a", k, Decimal("0.60"), {})
-    with pytest.raises(settlements.BudgetDenied):
-        await settlements.reserve("req-b", k, Decimal("0.20"), {})
-    await settlements.release("req-a")
-    await settlements.reserve("req-b", k, Decimal("0.20"), {})
 
 
 async def test_tpm_reservation_rejects_and_refunds():

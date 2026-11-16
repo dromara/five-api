@@ -25,17 +25,34 @@
 - 租户额度是累计美元上限，新租户默认 0、不自动重置；只有平台能调整，调整需带 UUID operation_id（reason 选填），同一 ID 重试幂等，内容不同返回 409，不能调到低于已用加占用。
 - 多个 Key 共享租户总额，Key 上限 -1 表示不另设，不会增加租户余额；撤销、新建 Key 不清空已用金额。
 - 新租户默认共享 120 RPM、100,000 TPM、10 并发，可设正数或 -1 不限；Key 可设更严的限制，仍受租户限制。每个租户默认最多 100 把未撤销 Key，创建限频 20 次/分钟。
-- 报价在请求前快照固定。`BILLING_MODE` 决定余额怎么管：
-  - 默认 `fast`：准入只比较已用加 Redis 里待入库的花费，不预占、不加锁，同一时刻并发的请求可以一起越过余额，超出部分照实扣费。花费写入 Redis 队列，后台整批提交日志、日汇总和 Key/租户已用，按请求 ID 去重，写库失败或 worker 退出时整批退回重写。Redis 数据丢失会丢掉尚未入库的花费。
-  - `strict`：请求按内部 UUID 足额预占；用量、Key 与租户扣费、日志、日汇总在一个事务提交，重试不重复扣费。失败和未知结果继续占用，等待核对。估算偏差和上游未知结果不保证绝对零超额。
-- 缺价、Redis 入队失败时，单笔改走 `strict` 的结算记录，不因队列不可用丢账。
+- 报价在请求前快照固定。准入比较 Key 和租户各自的已用、Redis 里待入库的花费（`five:billing:pending:*`）和结果未知请求的占用（`five:billing:held:*`），不预占、不加锁；同一时刻并发的请求可以一起越过余额，超出部分照实扣费，额度用完后新请求直接拒绝。
+- Redis 读不到上述计数时返回 503 `accounting_unavailable`，不调用上游；额度不限的 Key 和租户也一样。
+- 花费写入 Redis 队列，后台整批提交日志、日汇总和 Key/租户已用，同一笔在一个事务里提交，按请求 ID 去重，写库失败或 worker 退出时整批退回重写。Redis 数据丢失会丢掉尚未入库的花费，Redis 须开启持久化。
+- 上游已调用后入队失败、用量缺价时，单笔改走结算记录（Settlement）在 SQL 事务里扣费，不因队列不可用丢账。上游结果未知的请求写一条 uncertain 结算记录，按预估（多个候选渠道取最贵）继续占用额度，人工核对释放或按估算计费后才解除。
+- 正在处理请求的 worker 被强杀时，这些请求不会留下记录，也不扣费；正常停机会先排空请求。
 
 ## 查询边界
 
 - 所有租户查询在服务端限定归属，跨租户详情返回 404；视频查询、下载和历史任务同样先校验 Key 归属。
-- 租户只有 Key 页和改密入口。模型广场、价格、巡检和平台日志只对管理员开放。
-- 租户经 `GET /api/keys/channels` 只看到可用渠道的名称、倍率、模型价格和健康状态，不含上游地址与密钥。
-- 日志、错误、告警中的已知凭据都会脱敏；审计内容存库前把扫描命中的密钥替换为 `[REDACTED:类型]`。转发给租户的上游错误另外隐去平台的上游组织、项目编号和限流额度，管理员日志保留原文。只记录必要的管理事件：开户、额度、Key、价格、渠道、设置和异常处理。
+- 租户只有 Key 页和改密入口。模型广场、价格管理、巡检和平台日志只对管理员开放。
+- 租户经 `GET /api/keys/channels` 只看到可用渠道的名称、倍率、模型价格和健康状态，不含上游地址与密钥。`GET /api/keys/models`（可带 `key_id`）按租户模型范围、Key 的模型白名单和绑定渠道列出可调用模型的客户价，多个渠道价格不同时显示最高价并标 `varies_by_route`，按实际服务渠道结算；别的租户的 Key 返回 404。
+- Key 和租户响应的 `exhausted` 列出当前已用尽、准入会拒绝的额度（`quota` 或 `5h`、`1d`、`7d`），租户 Key 页据此提示。
+
+## 拒绝原因
+
+三种拒绝在 OpenAI 和 Anthropic 响应里使用同一状态码和 `error.code`（Anthropic 的 `error` 里额外带 `code`），消息不含上游地址、密钥和渠道编号，不与 401（Key 无效）、403（模型不在白名单、租户停用）冲突：
+
+| 情况 | 状态码 | `code` | 示例消息 |
+| --- | --- | --- | --- |
+| 缺价或停售 | 400 | `model_not_priced` | `Model gpt-x has no selling price; ask the platform administrator to set one` |
+| 额度用尽 | 429 | `quota_exceeded`、`tenant_quota_exceeded`、`window_limit`、`tenant_window_limit` | `Tenant quota is used up; ask the platform administrator to raise it` |
+| 无可用渠道 | 503 | `no_available_channel` | `No channel is available for model gpt-x; try again later or ask the platform administrator` |
+
+额度用尽时不改写模型，已开始的流式请求照常完成并照实计费。拒绝时按「预算」告警事件通知平台 Webhook，写明租户、Key 和哪一项额度，同一额度 12 小时内只发一次。渠道都已尝试仍失败时，返回最后一个上游的（脱敏）错误，不属于这三种。
+
+- 日志、错误、告警中的已知凭据都会脱敏。审计正文在进入计费队列之前就把扫描命中的密钥替换为 `[REDACTED:类型#指纹]`，指纹是密钥 SHA-256 的前 8 位十六进制，只能判断两次请求是否带了同一把密钥，不能还原密钥。AI 审查只读取存库后的脱敏正文。
+- 请求正文、密钥扫描结果、AI 审查和审计报告只给平台管理员。`/api/logs`、`/api/audit` 下的接口对租户账号一律返回 404，不提示资源是否存在。管理员每次读取正文（审计页按页加载、日志详情的正文）或下载报告都会写一条 `audit.view` / `audit.report_download` 管理事件，记录谁、何时、哪个 Key、涉及几条请求和时间范围。报告必须先登记成功才保存。
+- 转发给租户的上游错误另外隐去平台的上游组织、项目编号和限流额度，管理员日志保留原文。只记录必要的管理事件：开户、额度、Key、价格、渠道、设置和异常处理。
 
 ## 流式与模型巡检
 
@@ -64,6 +81,9 @@
 | `PUT /api/keys/{id}` | 租户可改 name、quota_total、allowed_models、expires_at、allowed_ips、rpm/tpm/并发限制、channel_ids、is_enabled |
 | `DELETE /api/keys/{id}` | 永久撤销，保留费用历史，不能再启用 |
 | `GET /api/keys/{id}/usage` | 最近 50 条请求元数据，不含正文和凭据 |
+| `GET /api/keys/bill`、`/api/keys/bill.csv` | 租户自己的账单：`start`、`end`（UTC 日期，最长 366 天，默认本月）内每个 Key 的请求数、已入库花费，以及导出时刻 Redis 中尚未入库的花费；CSV 带 `lang=zh/en`，附并发越额和尚未入库金额的说明。按租户归属过滤，不含渠道和上游信息；租户传别人的 `tenant_id` 返回 404，平台须传 `tenant_id` |
+| `GET /api/logs/{request_id}/audit`、`GET /api/audit/keys/{id}/requests` | 仅平台；返回脱敏正文和 `findings`（每处遮盖的类型、JSON 路径、指纹），每次读取记一条查看事件 |
+| `POST /api/audit/keys/{id}/report-downloads`、`GET /api/audit/views` | 仅平台；登记一次报告下载（`request_ids`）、按时间倒序列出查看与下载记录 |
 | `POST /api/channels/{id}/test` | 仅平台；传 `{"model":"渠道内模型名"}`，分别检测模型列表、原生生成和流式接口；不传请求体时检测第一个配置模型 |
 
 渠道检测返回 `model`、`actual_model` 和 `checks`：每项含 `kind`、`status`（passed / failed / timeout / skipped）、`status_code`、`latency_ms`、`first_text_ms`、脱敏 `error`、可选 `skip_reason`。OpenAI 渠道检测 models、chat、chat_stream、responses、responses_stream；Anthropic 渠道检测 models、messages、messages_stream。顶层 `success` 在至少有一项非跳过检查且所有非跳过项目通过时为 true，某一接口失败不代表其他接口不可用。

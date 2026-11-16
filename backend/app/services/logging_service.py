@@ -9,7 +9,7 @@ from tortoise.transactions import in_transaction
 from app.models import RequestLog, RequestLogAudit
 from app.services.metrics import record_request_metrics
 from app.services.usage_stats import record_daily_totals, record_daily_usage, record_minutes, _record_minute
-from app.services.redaction import redact
+from app.services.redaction import mask_secrets, redact
 from app.services.request_context import client_request_id as correlation_id
 
 logger = logging.getLogger(__name__)
@@ -51,9 +51,10 @@ def _build_log(
 ) -> tuple[RequestLog, str]:
     """An unsaved log row and its redacted audit text."""
     try:
-        audit_request = json.dumps(redact(json.loads(audit_request)), ensure_ascii=False) if audit_request else ""
+        audit_request = (json.dumps(redact(mask_secrets(json.loads(audit_request))), ensure_ascii=False)
+                         if audit_request else "")
     except (ValueError, TypeError):
-        audit_request = redact(audit_request)
+        audit_request = redact(mask_secrets(audit_request))
     log = RequestLog(
         request_id=request_id,
         client_request_id=client_request_id or correlation_id.get(),

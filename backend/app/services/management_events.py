@@ -16,6 +16,15 @@ async def record_event(actor: User, action: str, target_id: int, tenant_id: int 
     )
 
 
+async def record_view(actor: User, action: str, api_key_id: int, tenant_id: int, logs: list,
+                      extra: dict | None = None):
+    """Who opened which key's request bodies, and the time range they covered."""
+    times = [log.created_at for log in logs]
+    detail = {"requests": len(logs), "from": min(times).isoformat() if times else "",
+              "to": max(times).isoformat() if times else "", **(extra or {})}
+    return await record_event(actor, action, api_key_id, tenant_id, detail)
+
+
 def audit_mutation(action: str):
     """Record platform configuration mutations atomically, without credential values."""
     def decorate(function):

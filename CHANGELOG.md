@@ -2,7 +2,22 @@
 
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。打 `v*` tag 后，GitHub Actions 会把对应段落发成 Release，并推送镜像到 `ghcr.io/timmy1688/five-api`。
 
-## [Unreleased]
+## [0.7.0] - 2026-11-16
+
+### 变更
+
+- 移除 `strict` 计费模式和 `BILLING_MODE` 配置（[#4](https://github.com/dromara/five-api/issues/4)），所有请求都走批量入库计费：准入比较 Key 和租户的已用、Redis 中待入库的花费和结果未知请求的占用，不预占、不加锁。`BILLING_MODE` 设为 `strict` 或 `fast` 都按批量入库运行，残留的变量会被忽略并在启动日志里提示。
+- 读不到 Redis 中的花费计数时，请求返回 503 `accounting_unavailable`，上游不会被调用；额度不限的 Key 和租户也一样。
+- 上游结果未知的请求写一条 uncertain 结算记录，按预估（多个候选渠道取最贵）继续占用额度，处理后解除。后台每隔几秒按结算记录重建 Redis 里的占用计数，旧版本留下的 failed、uncertain 记录升级后同样计入。
+- Compose 里的 Redis 开启 AOF（每秒刷盘）。`./service.sh deploy` 和 `start` 会先让正在运行的 Redis 在线开启 AOF 再重建容器；直接用新 Compose 重建会让 Redis 忽略原有 RDB 数据。
+- **兼容边界**：同一时刻并发的请求可能一起越过 Key 或租户余额，超出部分照实扣费；正在处理请求的 worker 被强杀时，这些请求不留记录、不扣费；Redis 数据丢失会丢掉尚未入库的花费。
+- 移除「接近预算时降级」（[#7](https://github.com/dromara/five-api/issues/7)）：额度用尽的新请求直接拒绝，不再改写成便宜模型，响应不再带 `x-five-downgraded-to`；已保存的 `budget_downgrade` 设置被忽略。拒绝时按「预算」告警事件通知平台 Webhook，写明租户、Key 和哪一项额度。
+- 缺价、额度用尽、无可用渠道的拒绝各自固定：缺价或停售由 503 `pricing_unavailable` 改为 400 `model_not_priced`，消息写明模型名；额度用尽仍为 429，消息写明是 Key、租户还是滚动窗口；没有渠道提供该模型由 404 `model_not_found` 改为 503 `no_available_channel`。Anthropic 格式的错误里也带 `code`。按旧状态码或错误码判断的脚本需要调整。
+- 租户 Key 页新增「模型价格」，按租户模型范围、Key 的模型白名单和绑定渠道列出可调用模型的价格（`GET /api/keys/models`）；额度用尽时页面提示是哪一项，Key 和租户响应新增 `exhausted` 字段。
+- 请求正文、密钥扫描、AI 审查和审计报告只给平台管理员（[#5](https://github.com/dromara/five-api/issues/5)）：`/api/logs`、`/api/audit` 对租户账号由 403 改为 404。管理员读取正文和下载报告各记一条查看记录，审计页右上角「查看记录」可查；下载报告前先登记，登记失败不保存。
+- 密钥在进入计费队列前就被遮盖为 `[REDACTED:类型#指纹]`（此前存库为 `[REDACTED:类型]`，Redis 队列和结算记录里的正文同样只有遮盖后的内容）。审计接口新增 `findings`，列出每处遮盖的类型、JSON 路径和指纹；旧记录保持原样，没有指纹。
+- 租户 Key 页新增「账单」：按 UTC 日期范围列出每个 Key 的请求数、已入库花费和导出时刻尚未入库的花费，可导出 CSV（`GET /api/keys/bill`、`/api/keys/bill.csv`），并说明并发请求可能一起越过额度、超出部分照实扣费。
+- **升级步骤**：用旧版本时先在「系统设置」处理 failed、uncertain 结算记录（新版本也会继续计入它们）；停掉旧网关让请求和队列排空，再用 `./service.sh deploy` 升级。自己维护 Compose 的，升级前对 Redis 执行 `redis-cli config set appendonly yes`，等 `aof_rewrite_in_progress:0` 后再改配置。无需数据库迁移。
 
 ## [0.6.2] - 2026-11-14
 
